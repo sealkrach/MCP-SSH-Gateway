@@ -1,0 +1,6 @@
+apiVersion: v2
+name: mcp-ssh-gateway
+description: Enterprise SSH MCP Gateway
+type: application
+version: 2.0.0
+appVersion: "2.0.0"

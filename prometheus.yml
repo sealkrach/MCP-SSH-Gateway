@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'mcp-ssh-gateway'
+    static_configs:
+      - targets: ['gateway:8080']
+    metrics_path: /metrics/prometheus
+
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres:5432']

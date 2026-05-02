@@ -1,0 +1,50 @@
+replicaCount: 2
+
+image:
+  repository: mcp-ssh-gateway
+  tag: "2.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: true
+  className: nginx
+  host: mcp-ssh.internal
+  tls: true
+
+env:
+  JWT_SECRET: ""           # Required — override in secret
+  JWT_EXPIRE_HOURS: "24"
+  SSH_MODE: key            # key | vault
+  SSH_KEY_PATH: /run/secrets/ssh_key
+  VAULT_URL: ""
+  VAULT_TOKEN: ""
+  VAULT_MOUNT: ssh
+  RATE_PROD: "10"
+  RATE_STG: "30"
+  RATE_DEV: "100"
+  LOG_LEVEL: info
+
+database:
+  host: postgres
+  port: 5432
+  name: mcp_ssh
+  user: gateway
+  password: ""             # Required — override in secret
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70

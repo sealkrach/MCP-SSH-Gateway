@@ -1,0 +1,22 @@
+# Secrets — ne jamais committer
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Node
+ui/node_modules/
+ui/dist/
+
+# Data / logs
+*.db
+*.log
+gateway_data/
+
+# OS
+.DS_Store

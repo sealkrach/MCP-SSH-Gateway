@@ -1,0 +1,381 @@
+"""
+MCP SSH Gateway — FastAPI backend complet
+Routes: auth, hosts CRUD, exec SSH, policies CRUD, audit, metrics summary, health
+"""
+import asyncio, hashlib, logging, os, time, uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Optional
+
+import asyncssh
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+from pydantic import BaseModel
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, select, func
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from starlette.responses import FileResponse, Response
+
+from .auth import current_user, require_admin, router as auth_router
+from .policy import PolicyEngine, router as policy_router
+from .vault_ssh import VaultSSHClient
+
+log = logging.getLogger("gateway")
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./gateway.db")
+RATE_LIMITS  = {
+    "production":  int(os.getenv("RATE_PROD", "10")),
+    "staging":     int(os.getenv("RATE_STG",  "30")),
+    "development": int(os.getenv("RATE_DEV",  "100")),
+}
+
+# ── ORM ───────────────────────────────────────────────────────────────────────
+engine = create_async_engine(DATABASE_URL, echo=False)
+Session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+class Base(DeclarativeBase): pass
+
+class Host(Base):
+    __tablename__ = "hosts"
+    id            = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name          = Column(String, nullable=False, unique=True)
+    hostname      = Column(String, nullable=False)
+    port          = Column(Integer, default=22)
+    ssh_user      = Column(String, nullable=False, default="deploy")
+    env           = Column(String, nullable=False, default="development")
+    vault_role    = Column(String, nullable=False, default="dev-ssh")
+    allowed_roles = Column(String, nullable=False, default="dev")
+    enabled       = Column(Boolean, default=True)
+    created_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    updated_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
+                           onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id          = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id  = Column(String)
+    timestamp   = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    user        = Column(String, nullable=False)
+    host_name   = Column(String, nullable=False)
+    host_env    = Column(String, nullable=False)
+    command     = Column(Text, nullable=False)
+    status      = Column(String, nullable=False)  # allowed | denied | error
+    deny_reason = Column(Text)
+    stdout_hash = Column(String)
+    exit_code   = Column(Integer)
+    duration_ms = Column(Integer)
+    policy_id   = Column(String)
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+CMD_TOTAL  = Counter("mcp_ssh_commands_total",          "Commands total",    ["env","status"])
+CMD_DUR    = Histogram("mcp_ssh_command_duration_sec",  "Command duration",  ["env"])
+SESS_GAUGE = Gauge("mcp_ssh_active_sessions",           "Active sessions")
+DENY_CNT   = Counter("mcp_ssh_denials_total",           "Denials by policy", ["env","policy"])
+
+# ── Rate limiter ──────────────────────────────────────────────────────────────
+_rl: dict[str, list[float]] = {}
+
+def _rate_ok(key: str, env: str) -> bool:
+    limit = RATE_LIMITS.get(env, 30)
+    now   = time.time()
+    _rl[key] = [t for t in _rl.get(key, []) if now - t < 60]
+    if len(_rl[key]) >= limit:
+        return False
+    _rl[key].append(now)
+    return True
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    app.state.vault    = VaultSSHClient()
+    app.state.policies = PolicyEngine()
+    await app.state.policies.load()
+    log.info("Gateway ready — DB=%s SSH_MODE=%s", DATABASE_URL, os.getenv("SSH_MODE","key"))
+    yield
+    await engine.dispose()
+
+app = FastAPI(title="MCP SSH Gateway", version="2.0.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.include_router(auth_router)
+app.include_router(policy_router)
+
+# ── DB dependency ─────────────────────────────────────────────────────────────
+async def get_db():
+    async with Session() as s:
+        yield s
+
+# ── Pydantic ──────────────────────────────────────────────────────────────────
+class HostBody(BaseModel):
+    name:          str
+    hostname:      str
+    port:          int    = 22
+    ssh_user:      str    = "deploy"
+    env:           str    = "development"
+    vault_role:    str    = "dev-ssh"
+    allowed_roles: str    = "dev"
+    enabled:       bool   = True
+
+class ExecReq(BaseModel):
+    host:       str
+    command:    str
+    timeout:    int  = 60
+    session_id: Optional[str] = None
+
+# ── Host helpers ──────────────────────────────────────────────────────────────
+def _host_dict(h: Host) -> dict:
+    return {
+        "id": h.id, "name": h.name, "hostname": h.hostname, "port": h.port,
+        "ssh_user": h.ssh_user, "env": h.env, "vault_role": h.vault_role,
+        "allowed_roles": h.allowed_roles, "enabled": h.enabled,
+        "created_at": h.created_at.isoformat() if h.created_at else None,
+    }
+
+# ── Routes: Hosts ─────────────────────────────────────────────────────────────
+@app.get("/hosts")
+async def list_hosts(user=Depends(current_user), db: AsyncSession = Depends(get_db)):
+    user_roles = set(user["roles"])
+    rows = (await db.execute(select(Host).where(Host.enabled == True))).scalars().all()
+    # Admins see all; others see only hosts matching their roles
+    if "admin" in user_roles:
+        return [_host_dict(h) for h in rows]
+    return [_host_dict(h) for h in rows if user_roles & set(h.allowed_roles.split(","))]
+
+@app.post("/hosts", status_code=201)
+async def create_host(body: HostBody, user=Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    existing = (await db.execute(select(Host).where(Host.name == body.name))).scalar_one_or_none()
+    if existing:
+        raise HTTPException(409, f"Hôte '{body.name}' déjà existant")
+    host = Host(**body.model_dump())
+    db.add(host)
+    await db.commit()
+    await db.refresh(host)
+    return _host_dict(host)
+
+@app.put("/hosts/{host_id}")
+async def update_host(host_id: str, body: HostBody, user=Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    host = (await db.execute(select(Host).where(Host.id == host_id))).scalar_one_or_none()
+    if not host:
+        raise HTTPException(404)
+    for k, v in body.model_dump().items():
+        setattr(host, k, v)
+    host.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    await db.commit()
+    await db.refresh(host)
+    return _host_dict(host)
+
+@app.delete("/hosts/{host_id}")
+async def delete_host(host_id: str, user=Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    host = (await db.execute(select(Host).where(Host.id == host_id))).scalar_one_or_none()
+    if not host:
+        raise HTTPException(404)
+    host.enabled = False
+    await db.commit()
+    return {"deleted": True}
+
+# ── Route: Exec ───────────────────────────────────────────────────────────────
+@app.post("/exec")
+async def exec_cmd(body: ExecReq, req: Request, user=Depends(current_user), db: AsyncSession = Depends(get_db)):
+    host = (await db.execute(
+        select(Host).where(Host.name == body.host, Host.enabled == True)
+    )).scalar_one_or_none()
+    if not host:
+        raise HTTPException(404, f"Hôte '{body.host}' inconnu ou désactivé")
+
+    username   = user["sub"]
+    user_roles = set(user["roles"])
+    sid        = body.session_id or str(uuid.uuid4())
+    start      = int(time.time() * 1000)
+
+    # 1. RBAC
+    allowed_roles = set(host.allowed_roles.split(","))
+    if "admin" not in user_roles and not (user_roles & allowed_roles):
+        await _audit(db, sid, username, host, body.command, "denied", "Rôle insuffisant", None, None, 0, None)
+        return {"status": "denied", "reason": f"Rôle requis: {host.allowed_roles}"}
+
+    # 2. Rate limit
+    if not _rate_ok(f"{username}:{host.name}", host.env):
+        return {"status": "denied", "reason": f"Rate limit: max {RATE_LIMITS.get(host.env,30)} cmd/min en {host.env}"}
+
+    # 3. Policy
+    pol = await req.app.state.policies.evaluate({"host_env": host.env, "command": body.command, "user": username, "roles": list(user_roles)})
+    if pol["action"] == "deny":
+        await _audit(db, sid, username, host, body.command, "denied", pol["reason"], None, None, 0, pol.get("policy_id"))
+        DENY_CNT.labels(env=host.env, policy=pol.get("policy_id","?")).inc()
+        CMD_TOTAL.labels(env=host.env, status="denied").inc()
+        return {"status": "denied", "reason": pol["reason"]}
+
+    # 4. SSH credential (Vault cert, Vault KV, ou clé statique)
+    try:
+        key_path, cert_path, passphrase = await req.app.state.vault.get_credential(host.vault_role, username)
+    except Exception as e:
+        raise HTTPException(500, f"Credential SSH error: {e}")
+
+    # 5. Exec
+    SESS_GAUGE.inc()
+    stdout = stderr = ""; exit_code = -1
+    try:
+        conn_kwargs = dict(
+            host=host.hostname, port=host.port, username=host.ssh_user,
+            client_keys=[key_path], known_hosts=None, connect_timeout=10,
+        )
+        if cert_path:
+            conn_kwargs["cert_file"] = cert_path
+        if passphrase:
+            conn_kwargs["passphrase"] = passphrase
+
+        async with asyncssh.connect(**conn_kwargs) as conn:
+            result = await asyncio.wait_for(conn.run(body.command, check=False), timeout=body.timeout)
+            stdout    = result.stdout or ""
+            stderr    = result.stderr or ""
+            exit_code = result.exit_status or 0
+    except asyncio.TimeoutError:
+        CMD_TOTAL.labels(env=host.env, status="error").inc()
+        return {"status": "error", "reason": f"Timeout {body.timeout}s"}
+    except Exception as e:
+        log.error("SSH exec %s: %s", host.name, e)
+        CMD_TOTAL.labels(env=host.env, status="error").inc()
+        return {"status": "error", "reason": str(e)}
+    finally:
+        SESS_GAUGE.dec()
+        import os as _os, tempfile as _tmp
+        for p in [key_path, cert_path]:
+            if p and _os.path.exists(p) and p.startswith(_tmp.gettempdir()):
+                _os.unlink(p)
+
+    ms   = int(time.time() * 1000) - start
+    h256 = hashlib.sha256(stdout.encode()).hexdigest()
+    await _audit(db, sid, username, host, body.command, "allowed", None, h256, exit_code, ms, None)
+    CMD_TOTAL.labels(env=host.env, status="allowed").inc()
+    CMD_DUR.labels(env=host.env).observe(ms / 1000)
+    return {"status":"allowed","stdout":stdout,"stderr":stderr,"exit_code":exit_code,"duration_ms":ms,"stdout_hash":h256,"session_id":sid}
+
+async def _audit(db, sid, user, host, cmd, status, reason, h256, exit_code, ms, pol_id):
+    db.add(AuditLog(session_id=sid, user=user, host_name=host.name, host_env=host.env,
+                    command=cmd, status=status, deny_reason=reason, stdout_hash=h256,
+                    exit_code=exit_code, duration_ms=ms, policy_id=pol_id))
+    await db.commit()
+
+# ── Route: Audit ──────────────────────────────────────────────────────────────
+@app.get("/audit")
+async def get_audit(
+    limit: int = 50, env: Optional[str] = None, status: Optional[str] = None,
+    user_filter: Optional[str] = None,
+    user=Depends(current_user), db: AsyncSession = Depends(get_db),
+):
+    q = select(AuditLog).order_by(AuditLog.timestamp.desc()).limit(min(limit, 500))
+    if env:         q = q.where(AuditLog.host_env == env)
+    if status:      q = q.where(AuditLog.status == status)
+    if user_filter: q = q.where(AuditLog.user == user_filter)
+    rows = (await db.execute(q)).scalars().all()
+    return [{
+        "id": r.id, "session_id": r.session_id,
+        "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+        "user": r.user, "host_name": r.host_name, "host_env": r.host_env,
+        "command": r.command, "status": r.status, "deny_reason": r.deny_reason,
+        "stdout_hash": r.stdout_hash, "exit_code": r.exit_code,
+        "duration_ms": r.duration_ms, "policy_id": r.policy_id,
+    } for r in rows]
+
+# ── Route: Metrics summary (dashboard) ───────────────────────────────────────
+@app.get("/metrics/summary")
+async def metrics_summary(user=Depends(current_user), db: AsyncSession = Depends(get_db)):
+    now_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    async def count(status=None, env=None, since_hours=24):
+        from datetime import timedelta
+        q = select(func.count()).select_from(AuditLog).where(
+            AuditLog.timestamp >= (now_ts - timedelta(hours=since_hours))
+        )
+        if status: q = q.where(AuditLog.status == status)
+        if env:    q = q.where(AuditLog.host_env == env)
+        return (await db.execute(q)).scalar() or 0
+
+    total_24h   = await count()
+    denied_24h  = await count(status="denied")
+    allowed_24h = await count(status="allowed")
+    total_hosts = (await db.execute(select(func.count()).select_from(Host).where(Host.enabled==True))).scalar() or 0
+
+    # Env breakdown
+    env_counts = {}
+    for env in ("production","staging","development"):
+        env_counts[env] = await count(env=env)
+
+    # Per-hour last 24h
+    from datetime import timedelta
+    hourly = []
+    for h in range(23, -1, -1):
+        t_from = now_ts - timedelta(hours=h+1)
+        t_to   = now_ts - timedelta(hours=h)
+        q_h = select(func.count()).select_from(AuditLog).where(
+            AuditLog.timestamp >= t_from, AuditLog.timestamp < t_to
+        )
+        q_d = select(func.count()).select_from(AuditLog).where(
+            AuditLog.timestamp >= t_from, AuditLog.timestamp < t_to,
+            AuditLog.status == "denied"
+        )
+        c = (await db.execute(q_h)).scalar() or 0
+        d = (await db.execute(q_d)).scalar() or 0
+        hourly.append({"t": t_to.strftime("%H:%M"), "commands": c, "denied": d})
+
+    return {
+        "total_24h": total_24h, "denied_24h": denied_24h,
+        "allowed_24h": allowed_24h, "total_hosts": total_hosts,
+        "env_breakdown": env_counts, "hourly": hourly,
+    }
+
+# ── Route: Prometheus + health ────────────────────────────────────────────────
+@app.get("/metrics/prometheus")
+async def prom_metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.get("/health")
+async def health(req: Request):
+    vault_status = await req.app.state.vault.verify()
+    return {"status":"ok","version":"2.0.0","ssh_mode":os.getenv("SSH_MODE","key"),"vault":vault_status,"ts":datetime.now(timezone.utc).isoformat()}
+
+# ── Routes: Vault KV credentials ─────────────────────────────────────────────
+class VaultCredentials(BaseModel):
+    private_key: str
+    passphrase: Optional[str] = None
+
+@app.post("/vault/credentials", status_code=201)
+async def store_vault_credentials(body: VaultCredentials, req: Request, user=Depends(require_admin)):
+    try:
+        await req.app.state.vault.store_ssh_key(body.private_key, body.passphrase)
+        return {"stored": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.get("/vault/credentials/status")
+async def vault_credentials_status(req: Request, user=Depends(current_user)):
+    try:
+        return await req.app.state.vault.get_kv_status()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.delete("/vault/credentials")
+async def delete_vault_credentials(req: Request, user=Depends(require_admin)):
+    try:
+        await req.app.state.vault.delete_ssh_key()
+        return {"deleted": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+# ── Static UI (SPA) ───────────────────────────────────────────────────────────
+_static = Path("/app/static")
+if _static.exists():
+    _assets = _static / "assets"
+    if _assets.exists():
+        app.mount("/assets", StaticFiles(directory=str(_assets)), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa_fallback(full_path: str):
+        file = _static / full_path
+        if file.is_file():
+            return FileResponse(str(file))
+        return FileResponse(str(_static / "index.html"))

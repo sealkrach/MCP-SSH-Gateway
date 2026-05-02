@@ -1,0 +1,18 @@
+{
+  "preferences": {
+    "coworkWebSearchEnabled": true,
+    "coworkScheduledTasksEnabled": true,
+    "ccdScheduledTasksEnabled": true
+  },
+  "mcpServers": {
+    "ssh-gateway": {
+      "command": "python3",
+      "args": ["/absolute/path/to/gateway-v2/mcp_server/server.py"],
+      "env": {
+        "MCP_SSH_GATEWAY_URL": "http://localhost:8080",
+        "MCP_SSH_USER": "admin",
+        "MCP_SSH_PASS": "admin123"
+      }
+    }
+  }
+}
