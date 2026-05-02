@@ -48,6 +48,14 @@ export const auth = {
   users:    ()                   => req('GET',  '/auth/users'),
 }
 
+// ── API Tokens ────────────────────────────────────────────────────────────────
+export const tokens = {
+  list:   ()                              => req('GET',    '/auth/tokens'),
+  create: (name, username, roles, expires_days) =>
+    req('POST', '/auth/tokens', { body: { name, username: username || null, roles: roles || null, expires_days: expires_days || null } }),
+  revoke: (id)                            => req('DELETE', `/auth/tokens/${id}`),
+}
+
 // ── Hosts ─────────────────────────────────────────────────────────────────────
 export const hosts = {
   list:   ()          => req('GET',    '/hosts'),

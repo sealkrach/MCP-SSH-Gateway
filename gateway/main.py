@@ -15,28 +15,21 @@ from pathlib import Path
 from pydantic import BaseModel
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, select, func
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import FileResponse, Response
 
 from .auth import current_user, require_admin, router as auth_router
+from .db import Base, engine, Session, get_db
 from .policy import PolicyEngine, router as policy_router
 from .vault_ssh import VaultSSHClient
 
 log = logging.getLogger("gateway")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./gateway.db")
-RATE_LIMITS  = {
+RATE_LIMITS = {
     "production":  int(os.getenv("RATE_PROD", "10")),
     "staging":     int(os.getenv("RATE_STG",  "30")),
     "development": int(os.getenv("RATE_DEV",  "100")),
 }
-
-# ── ORM ───────────────────────────────────────────────────────────────────────
-engine = create_async_engine(DATABASE_URL, echo=False)
-Session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-class Base(DeclarativeBase): pass
 
 class Host(Base):
     __tablename__ = "hosts"
@@ -90,12 +83,18 @@ def _rate_ok(key: str, env: str) -> bool:
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    except Exception as e:
+        # Concurrent worker race: the other worker already created the schema
+        if "already exists" not in str(e).lower() and "unique" not in str(e).lower():
+            raise
+        log.warning("DB schema already exists (concurrent startup) — continuing")
     app.state.vault    = VaultSSHClient()
     app.state.policies = PolicyEngine()
     await app.state.policies.load()
-    log.info("Gateway ready — DB=%s SSH_MODE=%s", DATABASE_URL, os.getenv("SSH_MODE","key"))
+    log.info("Gateway ready — DB=%s SSH_MODE=%s", os.getenv("DATABASE_URL","sqlite"), os.getenv("SSH_MODE","key"))
     yield
     await engine.dispose()
 
@@ -103,11 +102,6 @@ app = FastAPI(title="MCP SSH Gateway", version="2.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.include_router(auth_router)
 app.include_router(policy_router)
-
-# ── DB dependency ─────────────────────────────────────────────────────────────
-async def get_db():
-    async with Session() as s:
-        yield s
 
 # ── Pydantic ──────────────────────────────────────────────────────────────────
 class HostBody(BaseModel):

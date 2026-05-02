@@ -1,8 +1,8 @@
 """
-Auth JWT statique — bootstrap rapide, sans Keycloak
+Auth — JWT statique + API tokens (format: mcp_<64 hex chars>)
 Users définis dans users.json ou ENV GATEWAY_USERS
 """
-import json, os, uuid
+import hashlib, json, os, secrets, uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -11,6 +11,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from pydantic import BaseModel
+from sqlalchemy import Boolean, Column, DateTime, select, String
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from .db import Base, get_db
 
 JWT_SECRET     = os.getenv("JWT_SECRET", "CHANGE-ME-IN-PROD-32chars-minimum!")
 JWT_ALGO       = "HS256"
@@ -40,20 +44,62 @@ def create_token(username: str, roles: list[str]) -> str:
         "jti": str(uuid.uuid4()),
     }, JWT_SECRET, algorithm=JWT_ALGO)
 
-def _verify(token: str) -> dict:
+def _verify_jwt(token: str) -> dict:
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
     except JWTError as e:
         raise HTTPException(401, f"Token invalide: {e}")
 
+# ── ApiToken ORM model ────────────────────────────────────────────────────────
+class ApiToken(Base):
+    __tablename__ = "api_tokens"
+    id           = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name         = Column(String, nullable=False)
+    token_hash   = Column(String, nullable=False, unique=True)
+    username     = Column(String, nullable=False)
+    roles        = Column(String, nullable=False)  # JSON-encoded list
+    created_at   = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    expires_at   = Column(DateTime, nullable=True)
+    last_used_at = Column(DateTime, nullable=True)
+    enabled      = Column(Boolean, default=True)
+
+def _token_dict(t: ApiToken) -> dict:
+    return {
+        "id": t.id, "name": t.name, "username": t.username,
+        "roles": json.loads(t.roles),
+        "created_at":   t.created_at.isoformat()   if t.created_at   else None,
+        "expires_at":   t.expires_at.isoformat()   if t.expires_at   else None,
+        "last_used_at": t.last_used_at.isoformat() if t.last_used_at else None,
+        "enabled": t.enabled,
+    }
+
+async def _verify_api_token(raw: str, db: AsyncSession) -> dict:
+    token_hash = hashlib.sha256(raw.encode()).hexdigest()
+    row = (await db.execute(
+        select(ApiToken).where(ApiToken.token_hash == token_hash, ApiToken.enabled == True)
+    )).scalar_one_or_none()
+    if not row:
+        raise HTTPException(401, "Token API invalide ou révoqué")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if row.expires_at and row.expires_at < now:
+        raise HTTPException(401, "Token API expiré")
+    row.last_used_at = now
+    await db.commit()
+    return {"sub": row.username, "roles": json.loads(row.roles), "token_id": row.id}
+
+# ── FastAPI auth dependency ───────────────────────────────────────────────────
 _bearer = HTTPBearer(auto_error=False)
 
 async def current_user(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+    db: AsyncSession = Depends(get_db),
 ) -> dict:
     if not creds:
         raise HTTPException(401, "Authorization: Bearer <token> manquant")
-    p = _verify(creds.credentials)
+    token = creds.credentials
+    if token.startswith("mcp_"):
+        return await _verify_api_token(token, db)
+    p = _verify_jwt(token)
     return {"sub": p["sub"], "roles": p.get("roles", []), "jti": p.get("jti")}
 
 def require_admin(user: dict = Depends(current_user)) -> dict:
@@ -88,3 +134,50 @@ async def me(user: dict = Depends(current_user)):
 @router.get("/users")
 async def list_users(user: dict = Depends(require_admin)):
     return [{"username": u["username"], "roles": u["roles"]} for u in _load_users()]
+
+# ── API Token CRUD ────────────────────────────────────────────────────────────
+class TokenCreate(BaseModel):
+    name:         str
+    username:     Optional[str]       = None
+    roles:        Optional[list[str]] = None
+    expires_days: Optional[int]       = None  # None = never expires
+
+@router.post("/tokens", status_code=201)
+async def create_api_token(
+    body: TokenCreate,
+    user: dict = Depends(require_admin),
+    db:   AsyncSession = Depends(get_db),
+):
+    raw        = "mcp_" + secrets.token_hex(32)
+    token_hash = hashlib.sha256(raw.encode()).hexdigest()
+    username   = body.username or user["sub"]
+    roles      = body.roles    or user["roles"]
+    expires_at = None
+    if body.expires_days:
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=body.expires_days)).replace(tzinfo=None)
+    t = ApiToken(
+        name=body.name, token_hash=token_hash,
+        username=username, roles=json.dumps(roles),
+        expires_at=expires_at,
+    )
+    db.add(t)
+    await db.commit()
+    await db.refresh(t)
+    return {**_token_dict(t), "token": raw}  # raw token returned only this once
+
+@router.get("/tokens")
+async def list_api_tokens(user: dict = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(select(ApiToken).order_by(ApiToken.created_at.desc()))).scalars().all()
+    return [_token_dict(r) for r in rows]
+
+@router.delete("/tokens/{token_id}", status_code=204)
+async def revoke_api_token(
+    token_id: str,
+    user: dict = Depends(require_admin),
+    db:   AsyncSession = Depends(get_db),
+):
+    row = (await db.execute(select(ApiToken).where(ApiToken.id == token_id))).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "Token introuvable")
+    row.enabled = False
+    await db.commit()

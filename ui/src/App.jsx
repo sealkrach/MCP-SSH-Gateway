@@ -480,11 +480,28 @@ function SettingsView() {
   const [vaultMsg,        setVaultMsg]        = useState(null)  // {type, text}
   const [showKey,         setShowKey]         = useState(false)
 
+  // API tokens state
+  const [apiTokens,       setApiTokens]       = useState([])
+  const [tokenName,       setTokenName]       = useState('')
+  const [tokenUser,       setTokenUser]       = useState('')
+  const [tokenRoles,      setTokenRoles]      = useState('')
+  const [tokenExpiry,     setTokenExpiry]     = useState('')
+  const [tokenCreating,   setTokenCreating]   = useState(false)
+  const [tokenMsg,        setTokenMsg]        = useState(null)
+  const [newTokenValue,   setNewTokenValue]   = useState(null)  // one-time display
+
+  const loadTokens = useCallback(() => {
+    api.tokens.list().then(setApiTokens).catch(()=>{})
+  }, [])
+
   useEffect(() => {
     if(tab === 'ssh') {
       api.vault.status().then(s => setVaultStatus(s)).catch(() => setVaultStatus(null))
     }
-  }, [tab])
+    if(tab === 'tokens') {
+      loadTokens()
+    }
+  }, [tab, loadTokens])
 
   const saveVaultKey = async () => {
     if(!vaultKey.trim()) { setVaultMsg({type:'error',text:'La clé privée est requise'}); return }
@@ -508,6 +525,28 @@ function SettingsView() {
     } catch(e) { setVaultMsg({type:'error',text:e.message}) }
   }
 
+  const createApiToken = async () => {
+    if(!tokenName.trim()) { setTokenMsg({type:'error',text:'Le nom du token est requis'}); return }
+    setTokenCreating(true); setTokenMsg(null); setNewTokenValue(null)
+    try {
+      const roles = tokenRoles.trim() ? tokenRoles.split(',').map(r=>r.trim()).filter(Boolean) : null
+      const res = await api.tokens.create(tokenName.trim(), tokenUser.trim()||null, roles, parseInt(tokenExpiry)||null)
+      setNewTokenValue(res.token)
+      setTokenMsg({type:'success',text:'Token créé — copiez-le maintenant, il ne sera plus affiché.'})
+      setTokenName(''); setTokenUser(''); setTokenRoles(''); setTokenExpiry('')
+      loadTokens()
+    } catch(e) { setTokenMsg({type:'error',text:e.message}) }
+    finally { setTokenCreating(false) }
+  }
+
+  const revokeApiToken = async (id) => {
+    if(!confirm('Révoquer ce token ?')) return
+    try {
+      await api.tokens.revoke(id)
+      loadTokens()
+    } catch(e) { setTokenMsg({type:'error',text:e.message}) }
+  }
+
   const F = ({label,k,type='text'}) => (
     <div style={{display:'flex',flexDirection:'column',gap:6}}>
       <label style={{fontSize:12,color:C.muted,fontFamily:FUI}}>{label}</label>
@@ -515,7 +554,7 @@ function SettingsView() {
     </div>
   )
 
-  const tabs = [{id:'gateway',icon:Globe,label:'Gateway'},{id:'ssh',icon:Key,label:'SSH / Vault'},{id:'status',icon:Activity,label:'État système'}]
+  const tabs = [{id:'gateway',icon:Globe,label:'Gateway'},{id:'ssh',icon:Key,label:'SSH / Vault'},{id:'tokens',icon:Zap,label:'API Tokens'},{id:'status',icon:Activity,label:'État système'}]
 
   return (
     <div style={{display:'flex',flexDirection:'column',gap:24}}>
@@ -620,6 +659,76 @@ function SettingsView() {
             {env.SSH_MODE==='key'&&'Mode dev : clé SSH statique montée depuis le système de fichiers.'}
             {env.SSH_MODE==='vault-kv'&&'Mode Vault KV : la clé privée est stockée chiffrée dans Vault et récupérée à chaque connexion SSH.'}
             {env.SSH_MODE==='vault'&&'Mode production : Vault génère des certificats ED25519 éphémères (TTL 5min). Aucune clé stockée.'}
+          </div>
+        </div>}
+
+        {tab==='tokens'&&<div style={{display:'flex',flexDirection:'column',gap:20}}>
+          {/* New token form */}
+          <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:20,display:'flex',flexDirection:'column',gap:14}}>
+            <div style={{fontFamily:FUI,fontWeight:700,fontSize:14,color:C.text,display:'flex',alignItems:'center',gap:8}}>
+              <Zap size={14} color={C.purple}/>Créer un token API
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+              <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                <label style={{fontSize:12,color:C.muted,fontFamily:FUI}}>Nom du token *</label>
+                <Inp value={tokenName} onChange={setTokenName} placeholder="ex: claude-prod"/>
+              </div>
+              <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                <label style={{fontSize:12,color:C.muted,fontFamily:FUI}}>Utilisateur (défaut: vous)</label>
+                <Inp value={tokenUser} onChange={setTokenUser} placeholder="admin"/>
+              </div>
+              <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                <label style={{fontSize:12,color:C.muted,fontFamily:FUI}}>Rôles (virgule, défaut: vos rôles)</label>
+                <Inp value={tokenRoles} onChange={setTokenRoles} placeholder="admin,ops,sre,dev"/>
+              </div>
+              <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                <label style={{fontSize:12,color:C.muted,fontFamily:FUI}}>Expiration (jours, vide = jamais)</label>
+                <Inp value={tokenExpiry} onChange={setTokenExpiry} placeholder="90" type="number"/>
+              </div>
+            </div>
+            <div style={{display:'flex',justifyContent:'flex-end'}}>
+              <Btn icon={Plus} onClick={createApiToken} loading={tokenCreating}>Générer le token</Btn>
+            </div>
+          </div>
+
+          {tokenMsg&&<Alert msg={tokenMsg.text} type={tokenMsg.type}/>}
+
+          {/* One-time token display */}
+          {newTokenValue&&<div style={{background:C.purple+'12',border:`1px solid ${C.purple}44`,borderRadius:10,padding:16,display:'flex',flexDirection:'column',gap:10}}>
+            <div style={{fontFamily:FUI,fontWeight:600,fontSize:13,color:C.purple,display:'flex',alignItems:'center',gap:6}}>
+              <Key size={14}/>Token généré — copiez-le maintenant
+            </div>
+            <div style={{background:C.card,borderRadius:8,padding:'10px 14px',fontFamily:FMONO,fontSize:12,color:C.text,wordBreak:'break-all',userSelect:'all',border:`1px solid ${C.border}`}}>
+              {newTokenValue}
+            </div>
+            <div style={{fontSize:11,color:C.muted,fontFamily:FUI}}>Ce token ne sera plus jamais affiché après fermeture de cet encart.</div>
+            <Btn icon={X} variant="ghost" small onClick={()=>setNewTokenValue(null)}>Fermer</Btn>
+          </div>}
+
+          {/* Token list */}
+          {apiTokens.length===0
+            ? <div style={{textAlign:'center',color:C.muted,fontFamily:FUI,fontSize:13,padding:'24px 0'}}>Aucun token API créé.</div>
+            : <div style={{display:'flex',flexDirection:'column',gap:8}}>
+                {apiTokens.map(t=>(
+                  <div key={t.id} style={{background:C.surface,border:`1px solid ${t.enabled?C.border:C.red+'44'}`,borderRadius:10,padding:'12px 16px',display:'flex',alignItems:'center',gap:12}}>
+                    <Dot on={t.enabled}/>
+                    <div style={{flex:1,minWidth:0}}>
+                      <div style={{fontFamily:FUI,fontWeight:600,fontSize:13,color:t.enabled?C.text:C.muted}}>{t.name}</div>
+                      <div style={{fontFamily:FMONO,fontSize:11,color:C.muted,marginTop:2}}>
+                        {t.username} · [{t.roles.join(', ')}]
+                        {t.expires_at&&<span> · exp: {t.expires_at.slice(0,10)}</span>}
+                        {t.last_used_at&&<span> · vu: {t.last_used_at.slice(0,10)}</span>}
+                      </div>
+                    </div>
+                    <span style={{fontFamily:FMONO,fontSize:10,color:C.muted}}>{t.created_at?.slice(0,10)}</span>
+                    {t.enabled&&<Btn icon={Trash2} variant="danger" small onClick={()=>revokeApiToken(t.id)}>Révoquer</Btn>}
+                  </div>
+                ))}
+              </div>
+          }
+
+          <div style={{background:C.purple+'12',border:`1px solid ${C.purple}44`,borderRadius:8,padding:'12px 16px',fontFamily:FUI,fontSize:13,color:C.purple}}>
+            Les tokens API (format <span style={{fontFamily:FMONO}}>mcp_...</span>) permettent à Claude et aux scripts d'accéder au gateway sans passer par le flux username/password.
           </div>
         </div>}
 
