@@ -22,6 +22,7 @@ DEFAULT_POLICIES = [
     {"id":"p006","name":"Block chmod 777",          "env":"all",         "pattern":r"chmod\s+777",                       "action":"deny", "enabled":True,  "severity":"high",    "triggers":2},
     {"id":"p007","name":"Warn find /",              "env":"production",  "pattern":r"find\s+/",                          "action":"warn", "enabled":True,  "severity":"medium",  "triggers":2},
     {"id":"p008","name":"Allow read-only ops",      "env":"all",         "pattern":r"^(df|du|free|ps|cat|ls|tail|grep|uptime|uname|id|whoami|hostname|date)", "action":"allow","enabled":True,"severity":"info","triggers":456},
+    {"id":"p009","name":"Block reboot/shutdown",    "env":"all",         "pattern":r"\breboot\b|shutdown\b|\bpoweroff\b|\bhalt\b|systemctl\s+(reboot|poweroff|halt)|init\s+[06]\b|telinit\s+[06]\b", "action":"deny","enabled":True,"severity":"critical","triggers":0},
 ]
 
 class PolicyEngine:
