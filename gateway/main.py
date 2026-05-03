@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import FileResponse, Response
 
 from .auth import current_user, require_admin, router as auth_router
+from .cyberark_ssh import CyberArkSSHClient
 from .db import Base, engine, Session, get_db
 from .policy import PolicyEngine, router as policy_router
 from .vault_ssh import VaultSSHClient
@@ -91,7 +92,8 @@ async def lifespan(app: FastAPI):
         if "already exists" not in str(e).lower() and "unique" not in str(e).lower():
             raise
         log.warning("DB schema already exists (concurrent startup) — continuing")
-    app.state.vault    = VaultSSHClient()
+    ssh_mode = os.getenv("SSH_MODE", "key")
+    app.state.vault    = CyberArkSSHClient() if ssh_mode == "cyberark" else VaultSSHClient()
     app.state.policies = PolicyEngine()
     await app.state.policies.load()
     log.info("Gateway ready — DB=%s SSH_MODE=%s", os.getenv("DATABASE_URL","sqlite"), os.getenv("SSH_MODE","key"))
@@ -203,9 +205,9 @@ async def exec_cmd(body: ExecReq, req: Request, user=Depends(current_user), db: 
         CMD_TOTAL.labels(env=host.env, status="denied").inc()
         return {"status": "denied", "reason": pol["reason"]}
 
-    # 4. SSH credential (Vault cert, Vault KV, ou clé statique)
+    # 4. SSH credential (Vault cert, Vault KV, clé statique ou CyberArk)
     try:
-        key_path, cert_path, passphrase = await req.app.state.vault.get_credential(host.vault_role, username)
+        key_path, cert_path, passphrase, password = await req.app.state.vault.get_credential(host.vault_role, username)
     except Exception as e:
         raise HTTPException(500, f"Credential SSH error: {e}")
 
@@ -215,12 +217,17 @@ async def exec_cmd(body: ExecReq, req: Request, user=Depends(current_user), db: 
     try:
         conn_kwargs = dict(
             host=host.hostname, port=host.port, username=host.ssh_user,
-            client_keys=[key_path], known_hosts=None, connect_timeout=10,
+            known_hosts=None, connect_timeout=10,
         )
-        if cert_path:
-            conn_kwargs["cert_file"] = cert_path
-        if passphrase:
-            conn_kwargs["passphrase"] = passphrase
+        if key_path:
+            conn_kwargs["client_keys"] = [key_path]
+            if cert_path:
+                conn_kwargs["cert_file"] = cert_path
+            if passphrase:
+                conn_kwargs["passphrase"] = passphrase
+        elif password:
+            conn_kwargs["password"] = password
+            conn_kwargs["preferred_auth"] = ["password"]
 
         async with asyncssh.connect(**conn_kwargs) as conn:
             result = await asyncio.wait_for(conn.run(body.command, check=False), timeout=body.timeout)
