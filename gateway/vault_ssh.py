@@ -22,17 +22,17 @@ SSH_TTL     = os.getenv("VAULT_SSH_TTL", "5m")
 
 class VaultSSHClient:
 
-    async def get_credential(self, vault_role: str, username: str) -> Tuple[str, Optional[str], Optional[str]]:
-        """Retourne (key_path, cert_path|None, passphrase|None)"""
+    async def get_credential(self, vault_role: str, username: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+        """Retourne (key_path, cert_path|None, passphrase|None, password|None)"""
         if SSH_MODE == "vault":
             key_path, cert_path = await self._vault_cert(vault_role, username)
-            return key_path, cert_path, None
+            return key_path, cert_path, None, None
         elif SSH_MODE == "vault-kv":
             key_path, passphrase = await self._vault_kv_key()
-            return key_path, None, passphrase
+            return key_path, None, passphrase, None
         else:
             key_path = await self._static_key()
-            return key_path, None, None
+            return key_path, None, None, None
 
     # ── Vault SSH CA mode ─────────────────────────────────────────────────────
     async def _vault_cert(self, role: str, username: str) -> Tuple[str, str]:
