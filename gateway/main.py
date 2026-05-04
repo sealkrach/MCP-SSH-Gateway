@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import FileResponse, Response
 
 from .auth import current_user, require_admin, router as auth_router
-from .cyberark_ssh import CyberArkSSHClient
+from .cyberark_ssh import CyberArkSSHClient, test_cyberark_connection
 from .db import Base, engine, Session, get_db
 from .policy import PolicyEngine, router as policy_router
 from .vault_ssh import VaultSSHClient
@@ -92,8 +92,7 @@ async def lifespan(app: FastAPI):
         if "already exists" not in str(e).lower() and "unique" not in str(e).lower():
             raise
         log.warning("DB schema already exists (concurrent startup) — continuing")
-    ssh_mode = os.getenv("SSH_MODE", "key")
-    app.state.vault    = CyberArkSSHClient() if ssh_mode == "cyberark" else VaultSSHClient()
+    app.state.vault    = CyberArkSSHClient() if os.getenv("SSH_MODE", "key").startswith("cyberark") else VaultSSHClient()
     app.state.policies = PolicyEngine()
     await app.state.policies.load()
     log.info("Gateway ready — DB=%s SSH_MODE=%s", os.getenv("DATABASE_URL","sqlite"), os.getenv("SSH_MODE","key"))
@@ -344,8 +343,13 @@ class VaultCredentials(BaseModel):
     private_key: str
     passphrase: Optional[str] = None
 
+def _require_vault_kv():
+    if os.getenv("SSH_MODE", "key") != "vault-kv":
+        raise HTTPException(400, "Disponible uniquement en mode vault-kv")
+
 @app.post("/vault/credentials", status_code=201)
 async def store_vault_credentials(body: VaultCredentials, req: Request, user=Depends(require_admin)):
+    _require_vault_kv()
     try:
         await req.app.state.vault.store_ssh_key(body.private_key, body.passphrase)
         return {"stored": True}
@@ -354,6 +358,7 @@ async def store_vault_credentials(body: VaultCredentials, req: Request, user=Dep
 
 @app.get("/vault/credentials/status")
 async def vault_credentials_status(req: Request, user=Depends(current_user)):
+    _require_vault_kv()
     try:
         return await req.app.state.vault.get_kv_status()
     except Exception as e:
@@ -361,11 +366,35 @@ async def vault_credentials_status(req: Request, user=Depends(current_user)):
 
 @app.delete("/vault/credentials")
 async def delete_vault_credentials(req: Request, user=Depends(require_admin)):
+    _require_vault_kv()
     try:
         await req.app.state.vault.delete_ssh_key()
         return {"deleted": True}
     except Exception as e:
         raise HTTPException(500, str(e))
+
+# ── Routes: CyberArk PAM ──────────────────────────────────────────────────────
+class CyberArkTestRequest(BaseModel):
+    url:        str
+    username:   str
+    password:   str
+    safe:       str
+    object_name: str
+    verify_ssl: bool = True
+
+@app.post("/cyberark/test")
+async def cyberark_test(body: CyberArkTestRequest, user=Depends(require_admin)):
+    result = await test_cyberark_connection(
+        body.url, body.username, body.password,
+        body.safe, body.object_name, body.verify_ssl,
+    )
+    return result
+
+@app.get("/cyberark/status")
+async def cyberark_status(req: Request, user=Depends(current_user)):
+    if os.getenv("SSH_MODE") == "cyberark":
+        return await req.app.state.vault.verify()
+    return {"mode": "cyberark", "ok": False, "configured": False}
 
 # ── Static UI (SPA) ───────────────────────────────────────────────────────────
 _static = Path("/app/static")

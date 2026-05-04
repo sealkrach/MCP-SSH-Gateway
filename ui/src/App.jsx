@@ -470,7 +470,7 @@ function SettingsView() {
   const {data:health, loading, reload} = useApi(api.health)
   const [tab,   setTab]   = useState('gateway')
   const [saved, setSaved] = useState(false)
-  const [env,   setEnv]   = useState({JWT_SECRET:'',JWT_EXPIRE_HOURS:'24',RATE_PROD:'10',RATE_STG:'30',RATE_DEV:'100',SSH_MODE:'key',SSH_KEY_PATH:'~/.ssh/id_rsa',VAULT_URL:'',VAULT_TOKEN:'',VAULT_MOUNT:'ssh'})
+  const [env,   setEnv]   = useState({JWT_SECRET:'',JWT_EXPIRE_HOURS:'24',RATE_PROD:'10',RATE_STG:'30',RATE_DEV:'100',SSH_MODE:'key',SSH_KEY_PATH:'~/.ssh/id_rsa',VAULT_URL:'',VAULT_TOKEN:'',VAULT_MOUNT:'ssh',CYBERARK_URL:'',CYBERARK_USERNAME:'',CYBERARK_PASSWORD:'',CYBERARK_SAFE:'',CYBERARK_OBJECT:'',CYBERARK_VERIFY_SSL:'true'})
 
   // Vault KV form state
   const [vaultKey,        setVaultKey]        = useState('')
@@ -479,6 +479,11 @@ function SettingsView() {
   const [vaultSaving,     setVaultSaving]     = useState(false)
   const [vaultMsg,        setVaultMsg]        = useState(null)  // {type, text}
   const [showKey,         setShowKey]         = useState(false)
+
+  // CyberArk PAM state
+  const [cyberarkStatus,  setCyberarkStatus]  = useState(null)
+  const [cyberarkTesting, setCyberarkTesting] = useState(false)
+  const [cyberarkMsg,     setCyberarkMsg]     = useState(null)
 
   // API tokens state
   const [apiTokens,       setApiTokens]       = useState([])
@@ -497,6 +502,9 @@ function SettingsView() {
   useEffect(() => {
     if(tab === 'ssh') {
       api.vault.status().then(s => setVaultStatus(s)).catch(() => setVaultStatus(null))
+    }
+    if(tab === 'cyberark') {
+      api.cyberark.status().then(s => setCyberarkStatus(s)).catch(() => setCyberarkStatus(null))
     }
     if(tab === 'tokens') {
       loadTokens()
@@ -523,6 +531,28 @@ function SettingsView() {
       setVaultStatus({stored:false, has_passphrase:false})
       setVaultMsg({type:'success',text:'Clé supprimée du Vault'})
     } catch(e) { setVaultMsg({type:'error',text:e.message}) }
+  }
+
+  const testCyberark = async () => {
+    if(!env.CYBERARK_URL.trim()) { setCyberarkMsg({type:'error',text:'L\'URL CyberArk est requise'}); return }
+    setCyberarkTesting(true); setCyberarkMsg(null)
+    try {
+      const res = await api.cyberark.test({
+        url: env.CYBERARK_URL.trim(),
+        username: env.CYBERARK_USERNAME.trim(),
+        password: env.CYBERARK_PASSWORD,
+        safe: env.CYBERARK_SAFE.trim(),
+        object_name: env.CYBERARK_OBJECT.trim(),
+        verify_ssl: env.CYBERARK_VERIFY_SSL !== 'false',
+      })
+      if(res.ok) {
+        setCyberarkMsg({type:'success', text: res.account_found ? 'Connexion réussie — compte SSH trouvé dans le coffre.' : 'Connexion réussie — mais aucun compte correspondant trouvé dans le coffre.'})
+      } else {
+        setCyberarkMsg({type:'error', text: res.error || 'Échec de connexion'})
+      }
+      setCyberarkStatus(res)
+    } catch(e) { setCyberarkMsg({type:'error',text:e.message}) }
+    finally { setCyberarkTesting(false) }
   }
 
   const createApiToken = async () => {
@@ -554,7 +584,7 @@ function SettingsView() {
     </div>
   )
 
-  const tabs = [{id:'gateway',icon:Globe,label:'Gateway'},{id:'ssh',icon:Key,label:'SSH / Vault'},{id:'tokens',icon:Zap,label:'API Tokens'},{id:'status',icon:Activity,label:'État système'}]
+  const tabs = [{id:'gateway',icon:Globe,label:'Gateway'},{id:'ssh',icon:Key,label:'SSH / Vault'},{id:'cyberark',icon:Shield,label:'CyberArk'},{id:'tokens',icon:Zap,label:'API Tokens'},{id:'status',icon:Activity,label:'État système'}]
 
   return (
     <div style={{display:'flex',flexDirection:'column',gap:24}}>
@@ -583,6 +613,7 @@ function SettingsView() {
               {value:'key',      label:'Clé statique (dev)'},
               {value:'vault-kv', label:'Vault KV — clé uploadée'},
               {value:'vault',    label:'Vault SSH CA — certificats éphémères (prod)'},
+              {value:'cyberark', label:'CyberArk PAM — récupération depuis un coffre'},
             ]}/>
           </div>
 
@@ -659,6 +690,66 @@ function SettingsView() {
             {env.SSH_MODE==='key'&&'Mode dev : clé SSH statique montée depuis le système de fichiers.'}
             {env.SSH_MODE==='vault-kv'&&'Mode Vault KV : la clé privée est stockée chiffrée dans Vault et récupérée à chaque connexion SSH.'}
             {env.SSH_MODE==='vault'&&'Mode production : Vault génère des certificats ED25519 éphémères (TTL 5min). Aucune clé stockée.'}
+            {env.SSH_MODE==='cyberark'&&<span>Mode CyberArk PAM : la clé SSH est récupérée depuis votre coffre à chaque connexion. Configurer la connexion dans l'onglet <strong>CyberArk</strong>.</span>}
+          </div>
+        </div>}
+
+        {tab==='cyberark'&&<div style={{display:'flex',flexDirection:'column',gap:20}}>
+          {/* Statut connexion */}
+          <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:'14px 18px',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+            <div style={{display:'flex',alignItems:'center',gap:10}}>
+              {cyberarkStatus?.ok
+                ? <CheckCircle size={16} color={C.green}/>
+                : <XCircle size={16} color={C.muted}/>}
+              <div>
+                <div style={{fontFamily:FUI,fontWeight:600,fontSize:13,color:cyberarkStatus?.ok?C.green:C.muted}}>
+                  {cyberarkStatus?.ok ? 'Connexion CyberArk active' : 'CyberArk non connecté'}
+                </div>
+                {cyberarkStatus?.url&&<div style={{fontFamily:FMONO,fontSize:11,color:C.muted,marginTop:2}}>{cyberarkStatus.url}</div>}
+              </div>
+            </div>
+          </div>
+
+          {/* Formulaire */}
+          <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:20,display:'flex',flexDirection:'column',gap:14}}>
+            <div style={{fontFamily:FUI,fontWeight:700,fontSize:14,color:C.text,display:'flex',alignItems:'center',gap:8}}>
+              <Shield size={14} color={C.purple}/>Configuration CyberArk PAM
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+              <div style={{gridColumn:'1/-1',display:'flex',flexDirection:'column',gap:6}}>
+                <label style={{fontSize:12,color:C.muted,fontFamily:FUI}}>URL CyberArk *</label>
+                <Inp value={env.CYBERARK_URL} onChange={v=>setEnv(e=>({...e,CYBERARK_URL:v}))} placeholder="https://cyberark.company.com"/>
+              </div>
+              <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                <label style={{fontSize:12,color:C.muted,fontFamily:FUI}}>Nom d'utilisateur *</label>
+                <Inp value={env.CYBERARK_USERNAME} onChange={v=>setEnv(e=>({...e,CYBERARK_USERNAME:v}))} placeholder="svc_mcp_gateway"/>
+              </div>
+              <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                <label style={{fontSize:12,color:C.muted,fontFamily:FUI}}>Mot de passe *</label>
+                <Inp value={env.CYBERARK_PASSWORD} onChange={v=>setEnv(e=>({...e,CYBERARK_PASSWORD:v}))} type="password" placeholder="••••••••"/>
+              </div>
+              <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                <label style={{fontSize:12,color:C.muted,fontFamily:FUI}}>Safe (coffre) *</label>
+                <Inp value={env.CYBERARK_SAFE} onChange={v=>setEnv(e=>({...e,CYBERARK_SAFE:v}))} placeholder="SSH-Keys"/>
+              </div>
+              <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                <label style={{fontSize:12,color:C.muted,fontFamily:FUI}}>Objet / Compte SSH *</label>
+                <Inp value={env.CYBERARK_OBJECT} onChange={v=>setEnv(e=>({...e,CYBERARK_OBJECT:v}))} placeholder="server-ssh-key"/>
+              </div>
+            </div>
+            <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer',fontFamily:FUI,fontSize:13,color:C.muted}}>
+              <input type="checkbox" checked={env.CYBERARK_VERIFY_SSL!=='false'} onChange={ev=>setEnv(e=>({...e,CYBERARK_VERIFY_SSL:ev.target.checked?'true':'false'}))} style={{accentColor:C.blue}}/>
+              Vérifier le certificat SSL
+            </label>
+            <div style={{display:'flex',justifyContent:'flex-end'}}>
+              <Btn icon={Wifi} onClick={testCyberark} loading={cyberarkTesting}>Tester la connexion</Btn>
+            </div>
+          </div>
+
+          {cyberarkMsg&&<Alert msg={cyberarkMsg.text} type={cyberarkMsg.type}/>}
+
+          <div style={{background:C.purple+'12',border:`1px solid ${C.purple}44`,borderRadius:8,padding:'12px 16px',fontFamily:FUI,fontSize:13,color:C.purple}}>
+            Mode CyberArk PAM : la clé SSH privée est récupérée depuis votre coffre à chaque connexion. Activer le mode via <span style={{fontFamily:FMONO}}>SSH_MODE=cyberark</span> dans l'onglet SSH / Vault.
           </div>
         </div>}
 
@@ -749,7 +840,7 @@ function SettingsView() {
             <div style={{background:health.vault?.ok?C.green+'12':C.red+'12',border:`1px solid ${health.vault?.ok?C.green:C.red}44`,borderRadius:8,padding:'12px 16px',display:'flex',gap:10,alignItems:'center'}}>
               {health.vault?.ok?<CheckCircle size={14} color={C.green}/>:<XCircle size={14} color={C.red}/>}
               <span style={{fontFamily:FMONO,fontSize:12,color:health.vault?.ok?C.green:C.red}}>
-                Vault: {health.vault?.mode} — {health.vault?.ok?'connecté':'erreur'}{health.vault?.error?` (${health.vault.error})`:''}
+                {health.vault?.mode==='cyberark'?'CyberArk':'Vault'}: {health.vault?.mode} — {health.vault?.ok?'connecté':'erreur'}{health.vault?.error?` (${health.vault.error})`:''}
                 {health.vault?.key_stored!==undefined&&` · clé: ${health.vault.key_stored?'stockée':'absente'}`}
               </span>
             </div>

@@ -90,5 +90,11 @@ export const vault = {
   delete: ()                        => req('DELETE', '/vault/credentials'),
 }
 
+// ── CyberArk PAM ─────────────────────────────────────────────────────────────
+export const cyberark = {
+  test:   (body) => req('POST', '/cyberark/test',   { body }),
+  status: ()     => req('GET',  '/cyberark/status'),
+}
+
 // ── Health ────────────────────────────────────────────────────────────────────
 export const health = () => req('GET', '/health')

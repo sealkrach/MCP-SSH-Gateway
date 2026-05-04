@@ -49,6 +49,47 @@ def _build_ssl() -> httpx.AsyncClient:
     return httpx.AsyncClient(verify=ssl_context, cert=cert, timeout=15.0)
 
 
+async def test_cyberark_connection(
+    url: str,
+    username: str,
+    password: str,
+    safe: str,
+    object_name: str,
+    verify_ssl: bool = True,
+) -> dict:
+    """Teste une connexion PVWA avec les credentials fournis (indépendant de app.state.vault)."""
+    try:
+        async with httpx.AsyncClient(verify=verify_ssl, timeout=10) as client:
+            r = await client.post(
+                f"{url}/PasswordVault/API/auth/cyberark/Logon",
+                json={"username": username, "password": password, "concurrentSession": True},
+            )
+            if r.status_code != 200:
+                return {"ok": False, "account_found": False,
+                        "error": f"Login {r.status_code}: {r.text[:200]}"}
+            token = r.json() if isinstance(r.json(), str) else r.text.strip('"')
+            account_found = False
+            try:
+                r2 = await client.get(
+                    f"{url}/PasswordVault/API/Accounts",
+                    params={"search": object_name, "SafeName": safe},
+                    headers={"Authorization": token},
+                )
+                account_found = r2.status_code == 200 and len(r2.json().get("value", [])) > 0
+            finally:
+                try:
+                    await client.post(f"{url}/PasswordVault/API/Auth/Logoff",
+                                      headers={"Authorization": token})
+                except Exception:
+                    pass
+        log.info("CyberArk test OK: url=%s safe=%s object=%s found=%s",
+                 url, safe, object_name, account_found)
+        return {"ok": True, "account_found": account_found, "error": None}
+    except Exception as e:
+        log.warning("CyberArk test failed: %s", e)
+        return {"ok": False, "account_found": False, "error": str(e)}
+
+
 class CyberArkSSHClient:
     """Provider de credentials SSH via CyberArk PAM."""
 
@@ -75,7 +116,6 @@ class CyberArkSSHClient:
         mode_label = f"cyberark-{CYBERARK_MODE}"
         try:
             if CYBERARK_MODE == "ccp":
-                # Ping CCP avec un objet fictif — on attend 404 ou 200, pas une erreur réseau
                 async with _build_ssl() as client:
                     r = await client.get(
                         f"{CYBERARK_URL}/AIMWebService/api/Accounts",
@@ -83,7 +123,6 @@ class CyberArkSSHClient:
                     )
                 ok = r.status_code in (200, 404, 400, 403)
             else:
-                # PVWA : tente un login pour valider les credentials
                 await self._pvwa_login()
                 ok = self._pvwa_token is not None
             return {"mode": mode_label, "ok": ok, "url": CYBERARK_URL}
@@ -127,7 +166,6 @@ class CyberArkSSHClient:
         await self._pvwa_ensure_token()
 
         async with _build_ssl() as client:
-            # Recherche du compte dans le Safe
             r = await client.get(
                 f"{CYBERARK_URL}/PasswordVault/API/Accounts",
                 params={"search": obj, "SafeName": safe},
@@ -144,7 +182,6 @@ class CyberArkSSHClient:
             account_id = accounts[0]["id"]
             log.debug("PVWA account found: id=%s Safe=%s Object=%s", account_id, safe, obj)
 
-            # Récupération du secret
             r2 = await client.post(
                 f"{CYBERARK_URL}/PasswordVault/API/Accounts/{account_id}/Password/Retrieve",
                 json={"reason": "MCP_SSH_Gateway"},
@@ -155,7 +192,6 @@ class CyberArkSSHClient:
                     f"CyberArk PVWA retrieve {r2.status_code} account={account_id}: {r2.text[:200]}"
                 )
 
-        # Le contenu du secret est renvoyé comme string JSON brute
         content = r2.json() if isinstance(r2.json(), str) else r2.text.strip('"')
         return {
             "Content": content,
@@ -165,7 +201,6 @@ class CyberArkSSHClient:
         }
 
     async def _pvwa_ensure_token(self) -> None:
-        """Renouvelle le token PVWA si expiré ou absent."""
         if self._pvwa_token and time.time() < self._pvwa_expires_at - 60:
             return
         await self._pvwa_login()
@@ -183,10 +218,7 @@ class CyberArkSSHClient:
                 "concurrentSession": True,
             })
         if r.status_code != 200:
-            raise RuntimeError(
-                f"CyberArk PVWA login {r.status_code}: {r.text[:200]}"
-            )
-        # Le token est renvoyé comme string JSON brute (avec guillemets)
+            raise RuntimeError(f"CyberArk PVWA login {r.status_code}: {r.text[:200]}")
         token = r.json() if isinstance(r.json(), str) else r.text.strip('"')
         self._pvwa_token = token
         self._pvwa_expires_at = time.time() + CYBERARK_SESSION_TIMEOUT
