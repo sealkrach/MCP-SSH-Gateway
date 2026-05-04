@@ -67,16 +67,26 @@ services:
       retries: 5
     networks: [mcp_net]
 
-  # ── Vault (dev mode — désactiver en prod) ─────────────────────────────────
+  # ── Vault (server mode avec persistance fichier) ──────────────────────────
   vault:
     image: hashicorp/vault:1.17
     restart: unless-stopped
     ports:
       - "8200:8200"
     environment:
-      VAULT_DEV_ROOT_TOKEN_ID:  ${VAULT_TOKEN:-dev-only-token}
-      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+      VAULT_STABLE_TOKEN: ${VAULT_TOKEN:-dev-only-token}
+    volumes:
+      - vault_data:/vault/data
+      - ./vault/config.hcl:/vault/config/config.hcl:ro
+      - ./vault/entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
     cap_add: [IPC_LOCK]
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -s http://localhost:8200/v1/sys/health | grep -q 'sealed.*false'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
     networks: [mcp_net]
 
   # ── Prometheus ────────────────────────────────────────────────────────────
@@ -112,6 +122,7 @@ services:
 volumes:
   pgdata:
   gateway_data:
+  vault_data:
   prom_data:
   grafana_data:
 
