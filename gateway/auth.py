@@ -2,7 +2,7 @@
 Auth — JWT statique + API tokens (format: mcp_<64 hex chars>)
 Users définis dans users.json ou ENV GATEWAY_USERS
 """
-import hashlib, json, os, secrets, uuid
+import hashlib, json, os, secrets, time, uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -44,11 +44,31 @@ def create_token(username: str, roles: list[str]) -> str:
         "jti": str(uuid.uuid4()),
     }, JWT_SECRET, algorithm=JWT_ALGO)
 
+# ── JWT in-process TTL cache ──────────────────────────────────────────────────
+# Stores decoded payloads keyed by token hash to avoid repeated crypto decode.
+# Per-worker only (not distributed) — intentional: keeps sensitive data local.
+_jwt_cache: dict[str, tuple[dict, float]] = {}  # hash → (payload, exp_ts)
+_JWT_CACHE_MAX = 2000
+
 def _verify_jwt(token: str) -> dict:
+    key = hashlib.sha256(token.encode()).hexdigest()
+    cached = _jwt_cache.get(key)
+    if cached:
+        payload, exp = cached
+        if time.time() < exp:
+            return payload
+        del _jwt_cache[key]
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
     except JWTError as e:
         raise HTTPException(401, f"Token invalide: {e}")
+    # Evict oldest 10% when cache is full
+    if len(_jwt_cache) >= _JWT_CACHE_MAX:
+        oldest = sorted(_jwt_cache, key=lambda k: _jwt_cache[k][1])[:_JWT_CACHE_MAX // 10]
+        for k in oldest:
+            del _jwt_cache[k]
+    _jwt_cache[key] = (payload, float(payload.get("exp", time.time() + 3600)))
+    return payload
 
 # ── ApiToken ORM model ────────────────────────────────────────────────────────
 class ApiToken(Base):

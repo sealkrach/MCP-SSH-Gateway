@@ -19,6 +19,25 @@ const EnvBadge = ({ env }) => {
   const [c,l] = m[env] || [C.muted, String(env||'?').toUpperCase()]
   return <span style={{background:c+'18',color:c,border:`1px solid ${c}44`,padding:'2px 8px',borderRadius:4,fontSize:10,fontFamily:FMONO,fontWeight:700,letterSpacing:1}}>{l}</span>
 }
+const CRED_MODES = {
+  'key':      { label:'Statique',  color:C.muted  },
+  'vault-kv': { label:'Vault KV',  color:C.purple },
+  'vault':    { label:'Vault CA',  color:C.cyan   },
+  'cyberark': { label:'CyberArk', color:C.peach  },
+}
+const CredBadge = ({ mode, role }) => {
+  const { label, color } = CRED_MODES[mode] || { label: mode||'?', color: C.muted }
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:3 }}>
+      <span style={{ background:color+'18', color, border:`1px solid ${color}44`,
+        padding:'1px 7px', borderRadius:4, fontSize:10, fontFamily:FMONO,
+        fontWeight:700, letterSpacing:0.5, width:'fit-content' }}>
+        {label}
+      </span>
+      <span style={{ fontFamily:FMONO, fontSize:11, color:C.muted }}>{role}</span>
+    </div>
+  )
+}
 const SevBadge = ({s}) => {
   const m = {critical:C.red,high:C.peach,medium:C.yellow,info:C.green}
   const c = m[s]||C.muted
@@ -173,6 +192,8 @@ const EMPTY_HOST = {name:'',hostname:'',port:22,ssh_user:'deploy',env:'developme
 
 function HostsView() {
   const {data:hostList, loading, error, reload} = useApi(api.hosts.list)
+  const {data:healthData} = useApi(api.health)
+  const sshMode = healthData?.ssh_mode || 'key'
   const [search,  setSearch]  = useState('')
   const [envF,    setEnvF]    = useState('all')
   const [showAdd, setShowAdd] = useState(false)
@@ -226,7 +247,7 @@ function HostsView() {
         {loading?<Spinner/>:
         <table style={{width:'100%',borderCollapse:'collapse'}}>
           <thead><tr style={{background:C.surface}}>
-            {['','Nom','IP / Hostname','Env','User SSH','Rôles','Vault Role',''].map(h=>(
+            {['','Nom','IP / Hostname','Env','User SSH','Rôles','Credential',''].map(h=>(
               <th key={h} style={{padding:'12px 16px',textAlign:'left',fontSize:11,color:C.muted,fontFamily:FUI,fontWeight:600,textTransform:'uppercase',letterSpacing:1,borderBottom:`1px solid ${C.border}`}}>{h}</th>
             ))}
           </tr></thead>
@@ -244,7 +265,7 @@ function HostsView() {
                   <span key={r} style={{background:C.purple+'20',color:C.purple,border:`1px solid ${C.purple}44`,padding:'1px 6px',borderRadius:4,fontSize:10,fontFamily:FMONO}}>{r.trim()}</span>
                 ))}
               </div></td>
-              <td style={{padding:'14px 16px',fontFamily:FMONO,fontSize:11,color:C.muted}}>{h.vault_role}</td>
+              <td style={{padding:'14px 16px'}}><CredBadge mode={sshMode} role={h.vault_role}/></td>
               <td style={{padding:'14px 16px'}}><div style={{display:'flex',gap:8}}>
                 <button onClick={()=>openEdit(h)} style={{background:'none',border:'none',color:C.muted,cursor:'pointer',padding:4}}><Edit size={14}/></button>
                 <button onClick={()=>del(h.id)} style={{background:'none',border:'none',color:C.red+'aa',cursor:'pointer',padding:4}}><Trash2 size={14}/></button>

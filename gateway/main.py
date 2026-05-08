@@ -4,17 +4,18 @@ Routes: auth, hosts CRUD, exec SSH, policies CRUD, audit, metrics summary, healt
 """
 import asyncio, hashlib, logging, os, time, uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import asyncssh
+import redis.asyncio as redis
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from pydantic import BaseModel
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, select, func
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, event as sa_event, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import FileResponse, Response
 
@@ -31,6 +32,7 @@ RATE_LIMITS = {
     "staging":     int(os.getenv("RATE_STG",  "30")),
     "development": int(os.getenv("RATE_DEV",  "100")),
 }
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 class Host(Base):
     __tablename__ = "hosts"
@@ -64,22 +66,35 @@ class AuditLog(Base):
     policy_id   = Column(String)
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
-CMD_TOTAL  = Counter("mcp_ssh_commands_total",          "Commands total",    ["env","status"])
-CMD_DUR    = Histogram("mcp_ssh_command_duration_sec",  "Command duration",  ["env"])
-SESS_GAUGE = Gauge("mcp_ssh_active_sessions",           "Active sessions")
-DENY_CNT   = Counter("mcp_ssh_denials_total",           "Denials by policy", ["env","policy"])
+CMD_TOTAL        = Counter("mcp_ssh_commands_total",          "Commands total",              ["env","status"])
+CMD_DUR          = Histogram("mcp_ssh_command_duration_sec",  "Command duration",            ["env"])
+SESS_GAUGE       = Gauge("mcp_ssh_active_sessions",           "Active sessions")
+DENY_CNT         = Counter("mcp_ssh_denials_total",           "Denials by policy",           ["env","policy"])
+DB_POOL_CHECKEDOUT = Gauge("db_pool_checked_out",             "DB connections checked out")
 
 # ── Rate limiter ──────────────────────────────────────────────────────────────
+# Primary: Redis sliding window (shared across all workers).
+# Fallback: in-process dict used when Redis is unavailable.
 _rl: dict[str, list[float]] = {}
 
-def _rate_ok(key: str, env: str) -> bool:
+async def _rate_ok(redis_client, key: str, env: str) -> bool:
     limit = RATE_LIMITS.get(env, 30)
     now   = time.time()
-    _rl[key] = [t for t in _rl.get(key, []) if now - t < 60]
-    if len(_rl[key]) >= limit:
-        return False
-    _rl[key].append(now)
-    return True
+    try:
+        pipe = redis_client.pipeline()
+        pipe.zremrangebyscore(key, 0, now - 60)
+        pipe.zcard(key)
+        pipe.zadd(key, {str(now): now})
+        pipe.expire(key, 120)
+        results = await pipe.execute()
+        return results[1] < limit          # count BEFORE the new zadd
+    except Exception:
+        # Redis unavailable — fall back to per-worker in-memory limiter
+        _rl[key] = [t for t in _rl.get(key, []) if now - t < 60]
+        if len(_rl[key]) >= limit:
+            return False
+        _rl[key].append(now)
+        return True
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -92,15 +107,41 @@ async def lifespan(app: FastAPI):
         if "already exists" not in str(e).lower() and "unique" not in str(e).lower():
             raise
         log.warning("DB schema already exists (concurrent startup) — continuing")
+
+    # DB pool metrics via SQLAlchemy events (no-op on SQLite which has no pool)
+    try:
+        @sa_event.listens_for(engine.sync_engine, "checkout")
+        def _pool_checkout(dbapi_conn, conn_rec, conn_proxy):
+            DB_POOL_CHECKEDOUT.inc()
+
+        @sa_event.listens_for(engine.sync_engine, "checkin")
+        def _pool_checkin(dbapi_conn, conn_rec):
+            DB_POOL_CHECKEDOUT.dec()
+    except Exception:
+        pass
+
+    app.state.redis    = redis.from_url(REDIS_URL, decode_responses=True)
     app.state.vault    = CyberArkSSHClient() if os.getenv("SSH_MODE", "key").startswith("cyberark") else VaultSSHClient()
     app.state.policies = PolicyEngine()
     await app.state.policies.load()
-    log.info("Gateway ready — DB=%s SSH_MODE=%s", os.getenv("DATABASE_URL","sqlite"), os.getenv("SSH_MODE","key"))
+    log.info("Gateway ready — DB=%s SSH_MODE=%s REDIS=%s",
+             os.getenv("DATABASE_URL","sqlite"), os.getenv("SSH_MODE","key"), REDIS_URL)
     yield
     await engine.dispose()
+    await app.state.redis.aclose()
+    if hasattr(app.state.vault, "close"):
+        await app.state.vault.close()
 
 app = FastAPI(title="MCP SSH Gateway", version="2.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = rid
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = rid
+    return response
 app.include_router(auth_router)
 app.include_router(policy_router)
 
@@ -193,7 +234,7 @@ async def exec_cmd(body: ExecReq, req: Request, user=Depends(current_user), db: 
         return {"status": "denied", "reason": f"Rôle requis: {host.allowed_roles}"}
 
     # 2. Rate limit
-    if not _rate_ok(f"{username}:{host.name}", host.env):
+    if not await _rate_ok(req.app.state.redis, f"rl:{username}:{host.name}", host.env):
         return {"status": "denied", "reason": f"Rate limit: max {RATE_LIMITS.get(host.env,30)} cmd/min en {host.env}"}
 
     # 3. Policy
@@ -284,43 +325,42 @@ async def get_audit(
 # ── Route: Metrics summary (dashboard) ───────────────────────────────────────
 @app.get("/metrics/summary")
 async def metrics_summary(user=Depends(current_user), db: AsyncSession = Depends(get_db)):
-    now_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+    now_ts   = datetime.now(timezone.utc).replace(tzinfo=None)
+    since_24 = now_ts - timedelta(hours=24)
 
-    async def count(status=None, env=None, since_hours=24):
-        from datetime import timedelta
-        q = select(func.count()).select_from(AuditLog).where(
-            AuditLog.timestamp >= (now_ts - timedelta(hours=since_hours))
-        )
-        if status: q = q.where(AuditLog.status == status)
-        if env:    q = q.where(AuditLog.host_env == env)
-        return (await db.execute(q)).scalar() or 0
+    # Single query for all audit data in the last 24h — aggregated in Python.
+    # Replaces the previous 48 sequential DB round-trips.
+    rows = (await db.execute(
+        select(AuditLog.timestamp, AuditLog.status, AuditLog.host_env)
+        .where(AuditLog.timestamp >= since_24)
+    )).all()
 
-    total_24h   = await count()
-    denied_24h  = await count(status="denied")
-    allowed_24h = await count(status="allowed")
-    total_hosts = (await db.execute(select(func.count()).select_from(Host).where(Host.enabled==True))).scalar() or 0
+    total_24h = denied_24h = allowed_24h = 0
+    env_counts = {"production": 0, "staging": 0, "development": 0}
+    hourly = [
+        {"t": (now_ts - timedelta(hours=h)).strftime("%H:%M"), "commands": 0, "denied": 0}
+        for h in range(23, -1, -1)
+    ]
 
-    # Env breakdown
-    env_counts = {}
-    for env in ("production","staging","development"):
-        env_counts[env] = await count(env=env)
+    for ts, status, env in rows:
+        total_24h += 1
+        if status == "denied":
+            denied_24h += 1
+        elif status == "allowed":
+            allowed_24h += 1
+        if env in env_counts:
+            env_counts[env] += 1
+        if ts:
+            hours_ago = int((now_ts - ts).total_seconds() / 3600)
+            if 0 <= hours_ago < 24:
+                idx = 23 - hours_ago
+                hourly[idx]["commands"] += 1
+                if status == "denied":
+                    hourly[idx]["denied"] += 1
 
-    # Per-hour last 24h
-    from datetime import timedelta
-    hourly = []
-    for h in range(23, -1, -1):
-        t_from = now_ts - timedelta(hours=h+1)
-        t_to   = now_ts - timedelta(hours=h)
-        q_h = select(func.count()).select_from(AuditLog).where(
-            AuditLog.timestamp >= t_from, AuditLog.timestamp < t_to
-        )
-        q_d = select(func.count()).select_from(AuditLog).where(
-            AuditLog.timestamp >= t_from, AuditLog.timestamp < t_to,
-            AuditLog.status == "denied"
-        )
-        c = (await db.execute(q_h)).scalar() or 0
-        d = (await db.execute(q_d)).scalar() or 0
-        hourly.append({"t": t_to.strftime("%H:%M"), "commands": c, "denied": d})
+    total_hosts = (await db.execute(
+        select(func.count()).select_from(Host).where(Host.enabled == True)
+    )).scalar() or 0
 
     return {
         "total_24h": total_24h, "denied_24h": denied_24h,

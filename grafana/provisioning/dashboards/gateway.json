@@ -1,0 +1,94 @@
+{
+  "title": "MCP SSH Gateway",
+  "uid": "mcp-ssh-gateway",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Commandes / min",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "rate(mcp_ssh_commands_total[1m]) * 60",
+        "legendFormat": "cmd/min"
+      }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" },
+        "thresholds": { "steps": [{"color":"green","value":0},{"color":"yellow","value":50},{"color":"red","value":100}] }}}
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Sessions SSH actives",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "mcp_ssh_active_sessions", "legendFormat": "sessions" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" },
+        "thresholds": { "steps": [{"color":"green","value":0},{"color":"yellow","value":20},{"color":"red","value":50}] }}}
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Refus / min",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "rate(mcp_ssh_denials_total[1m]) * 60", "legendFormat": "refus/min" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" },
+        "thresholds": { "steps": [{"color":"green","value":0},{"color":"yellow","value":5},{"color":"red","value":20}] }}}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Connexions DB pool",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "targets": [{ "expr": "db_pool_checked_out", "legendFormat": "checked out" }],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" },
+        "thresholds": { "steps": [{"color":"green","value":0},{"color":"yellow","value":15},{"color":"red","value":25}] }}}
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Commandes par statut (rate 1m)",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(mcp_ssh_commands_total{status=\"allowed\"}[1m])", "legendFormat": "Autorisées" },
+        { "expr": "rate(mcp_ssh_commands_total{status=\"denied\"}[1m])",  "legendFormat": "Refusées"  },
+        { "expr": "rate(mcp_ssh_commands_total{status=\"error\"}[1m])",   "legendFormat": "Erreurs"   }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Latence commandes SSH (p50 / p95 / p99)",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(mcp_ssh_command_duration_sec_bucket[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(mcp_ssh_command_duration_sec_bucket[5m]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, rate(mcp_ssh_command_duration_sec_bucket[5m]))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Connexions DB pool (checked out)",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 6 },
+      "targets": [{ "expr": "db_pool_checked_out", "legendFormat": "Actives" }],
+      "fieldConfig": { "defaults": { "unit": "short",
+        "thresholds": { "steps": [{"color":"green","value":0},{"color":"red","value":20}] }}}
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Refus par policy",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 6 },
+      "targets": [{ "expr": "rate(mcp_ssh_denials_total[5m])", "legendFormat": "{{env}} / {{policy}}" }],
+      "fieldConfig": { "defaults": { "unit": "reqps" } }
+    }
+  ]
+}

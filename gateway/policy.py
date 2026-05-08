@@ -28,16 +28,28 @@ DEFAULT_POLICIES = [
 class PolicyEngine:
     def __init__(self):
         self._rules: list[dict] = []
+        self._compiled: list[tuple] = []  # (re.Pattern, rule_dict)
+
+    def _compile(self):
+        result = []
+        for rule in self._rules:
+            try:
+                result.append((re.compile(rule["pattern"], re.IGNORECASE), rule))
+            except re.error as e:
+                log.error("Invalid regex in policy %s: %s", rule["id"], e)
+        self._compiled = result
 
     async def load(self):
         if POLICY_FILE.exists():
             try:
                 self._rules = json.loads(POLICY_FILE.read_text())
+                self._compile()
                 log.info("Loaded %d policies", len(self._rules))
                 return
             except Exception as e:
                 log.warning("Policy file error: %s — using defaults", e)
         self._rules = [r.copy() for r in DEFAULT_POLICIES]
+        self._compile()
 
     async def _save(self):
         POLICY_FILE.write_text(json.dumps(self._rules, indent=2))
@@ -47,29 +59,27 @@ class PolicyEngine:
 
     async def evaluate(self, ctx: dict) -> dict:
         env, command = ctx.get("host_env",""), ctx.get("command","")
-        for rule in self._rules:
+        for pattern, rule in self._compiled:
             if not rule.get("enabled", True):
                 continue
             if rule.get("env","all") not in ("all", env):
                 continue
-            try:
-                if re.search(rule["pattern"], command, re.IGNORECASE):
-                    action = rule.get("action","deny")
-                    rule["triggers"] = rule.get("triggers",0) + 1
-                    await self._save()
-                    if action == "deny":
-                        log.warning("DENY user=%s env=%s cmd=%r rule=%s", ctx.get("user"), env, command, rule["id"])
-                        return {"action":"deny","reason":f"[{rule['name']}] commande non autorisée","policy_id":rule["id"]}
-                    elif action == "warn":
-                        log.warning("WARN user=%s env=%s cmd=%r rule=%s", ctx.get("user"), env, command, rule["id"])
-            except re.error as e:
-                log.error("Regex error policy %s: %s", rule["id"], e)
+            if pattern.search(command):
+                action = rule.get("action","deny")
+                rule["triggers"] = rule.get("triggers",0) + 1
+                await self._save()
+                if action == "deny":
+                    log.warning("DENY user=%s env=%s cmd=%r rule=%s", ctx.get("user"), env, command, rule["id"])
+                    return {"action":"deny","reason":f"[{rule['name']}] commande non autorisée","policy_id":rule["id"]}
+                elif action == "warn":
+                    log.warning("WARN user=%s env=%s cmd=%r rule=%s", ctx.get("user"), env, command, rule["id"])
         return {"action":"allow","reason":None,"policy_id":None}
 
     async def create(self, data: dict) -> dict:
         data["id"] = data.get("id") or f"p{str(uuid.uuid4())[:8]}"
         data.setdefault("triggers", 0)
         self._rules.append(data)
+        self._compile()
         await self._save()
         return data
 
@@ -77,6 +87,7 @@ class PolicyEngine:
         for i, r in enumerate(self._rules):
             if r["id"] == rule_id:
                 self._rules[i] = {**r, **data, "id": rule_id}
+                self._compile()
                 await self._save()
                 return self._rules[i]
         return None
@@ -85,6 +96,7 @@ class PolicyEngine:
         before = len(self._rules)
         self._rules = [r for r in self._rules if r["id"] != rule_id]
         if len(self._rules) < before:
+            self._compile()
             await self._save()
             return True
         return False

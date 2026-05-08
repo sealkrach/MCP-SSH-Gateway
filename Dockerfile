@@ -33,6 +33,4 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD curl -f http://localhost:8080/health || exit 1
 
-CMD ["uvicorn", "gateway.main:app", \
-     "--host", "0.0.0.0", "--port", "8080", \
-     "--workers", "2", "--log-level", "info"]
+CMD uvicorn gateway.main:app --host 0.0.0.0 --port 8080 --workers ${WEB_CONCURRENCY:-4} --log-level info

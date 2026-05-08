@@ -25,17 +25,26 @@ services:
       RATE_STG:          ${RATE_STG:-30}
       RATE_DEV:          ${RATE_DEV:-100}
       LOG_LEVEL:         ${LOG_LEVEL:-info}
+      REDIS_URL:         redis://redis:6379
+      WEB_CONCURRENCY:   ${WEB_CONCURRENCY:-4}
     volumes:
       - ~/.ssh/id_rsa:/run/secrets/ssh_key:ro   # clé SSH locale en mode dev
       - gateway_data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
+      interval: 15s
       timeout: 5s
       retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
     networks: [mcp_net]
 
   # ── Nginx reverse proxy (UI → gateway) ───────────────────────────────────
@@ -65,6 +74,30 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    networks: [mcp_net]
+
+  # ── Redis (rate limiting distribué + cache) ───────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 320M
     networks: [mcp_net]
 
   # ── Vault (server mode avec persistance fichier) ──────────────────────────
