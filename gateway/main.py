@@ -380,8 +380,9 @@ async def health(req: Request):
 
 # ── Routes: Vault KV credentials ─────────────────────────────────────────────
 class VaultCredentials(BaseModel):
+    vault_role:  str
     private_key: str
-    passphrase: Optional[str] = None
+    passphrase:  Optional[str] = None
 
 def _require_vault_kv():
     if os.getenv("SSH_MODE", "key") != "vault-kv":
@@ -391,25 +392,25 @@ def _require_vault_kv():
 async def store_vault_credentials(body: VaultCredentials, req: Request, user=Depends(require_admin)):
     _require_vault_kv()
     try:
-        await req.app.state.vault.store_ssh_key(body.private_key, body.passphrase)
-        return {"stored": True}
+        await req.app.state.vault.store_ssh_key(body.vault_role, body.private_key, body.passphrase)
+        return {"stored": True, "vault_role": body.vault_role}
     except Exception as e:
         raise HTTPException(500, str(e))
 
 @app.get("/vault/credentials/status")
-async def vault_credentials_status(req: Request, user=Depends(current_user)):
+async def vault_credentials_status(vault_role: str, req: Request, user=Depends(current_user)):
     _require_vault_kv()
     try:
-        return await req.app.state.vault.get_kv_status()
+        return await req.app.state.vault.get_kv_status(vault_role)
     except Exception as e:
         raise HTTPException(500, str(e))
 
 @app.delete("/vault/credentials")
-async def delete_vault_credentials(req: Request, user=Depends(require_admin)):
+async def delete_vault_credentials(vault_role: str, req: Request, user=Depends(require_admin)):
     _require_vault_kv()
     try:
-        await req.app.state.vault.delete_ssh_key()
-        return {"deleted": True}
+        await req.app.state.vault.delete_ssh_key(vault_role)
+        return {"deleted": True, "vault_role": vault_role}
     except Exception as e:
         raise HTTPException(500, str(e))
 

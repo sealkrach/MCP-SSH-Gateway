@@ -54,7 +54,7 @@ class VaultSSHClient:
             key_path, cert_path = await self._vault_cert(vault_role, username)
             return key_path, cert_path, None, None
         elif SSH_MODE == "vault-kv":
-            key_path, passphrase = await self._vault_kv_key()
+            key_path, passphrase = await self._vault_kv_key(vault_role)
             return key_path, None, passphrase, None
         else:
             key_path = await self._static_key()
@@ -84,8 +84,11 @@ class VaultSSHClient:
         return kf.name, cf.name
 
     # ── Vault KV mode ─────────────────────────────────────────────────────────
-    async def _vault_kv_key(self) -> Tuple[str, Optional[str]]:
-        cache_key = f"{VAULT_KV_MOUNT}/{VAULT_KV_PATH}"
+    def _kv_path(self, vault_role: str) -> str:
+        return f"{VAULT_KV_PATH}/{vault_role}"
+
+    async def _vault_kv_key(self, vault_role: str) -> Tuple[str, Optional[str]]:
+        cache_key = f"{VAULT_KV_MOUNT}/{self._kv_path(vault_role)}"
         cached = _KV_CACHE.get(cache_key)
         if cached:
             key_content, passphrase, fetched_at = cached
@@ -95,13 +98,13 @@ class VaultSSHClient:
                 os.chmod(kf.name, 0o600)
                 return kf.name, passphrase
 
-        resp = await self._client().get(f"/v1/{VAULT_KV_MOUNT}/data/{VAULT_KV_PATH}")
+        resp = await self._client().get(f"/v1/{VAULT_KV_MOUNT}/data/{self._kv_path(vault_role)}")
         if resp.status_code != 200:
-            raise RuntimeError(f"Vault KV read failed ({resp.status_code}): {resp.text}")
+            raise RuntimeError(f"Vault KV read failed for role '{vault_role}' ({resp.status_code}): {resp.text}")
         data = resp.json()["data"]["data"]
         private_key = data.get("private_key", "")
         if not private_key:
-            raise RuntimeError("Aucune clé privée dans Vault KV — en stocker une via l'UI")
+            raise RuntimeError(f"Aucune clé privée dans Vault KV pour le rôle '{vault_role}' — en stocker une via l'UI")
         passphrase = data.get("passphrase") or None
 
         _KV_CACHE[cache_key] = (private_key, passphrase, time.time())
@@ -111,21 +114,21 @@ class VaultSSHClient:
         os.chmod(kf.name, 0o600)
         return kf.name, passphrase
 
-    async def store_ssh_key(self, private_key: str, passphrase: Optional[str] = None) -> None:
-        _KV_CACHE.pop(f"{VAULT_KV_MOUNT}/{VAULT_KV_PATH}", None)  # invalidate cache
+    async def store_ssh_key(self, vault_role: str, private_key: str, passphrase: Optional[str] = None) -> None:
+        _KV_CACHE.pop(f"{VAULT_KV_MOUNT}/{self._kv_path(vault_role)}", None)
         data = {"private_key": private_key}
         if passphrase:
             data["passphrase"] = passphrase
         resp = await self._client().post(
-            f"/v1/{VAULT_KV_MOUNT}/data/{VAULT_KV_PATH}",
+            f"/v1/{VAULT_KV_MOUNT}/data/{self._kv_path(vault_role)}",
             json={"data": data},
         )
         if resp.status_code not in (200, 204):
             raise RuntimeError(f"Vault KV write failed ({resp.status_code}): {resp.text}")
-        log.info("SSH key stored in Vault KV at %s/%s", VAULT_KV_MOUNT, VAULT_KV_PATH)
+        log.info("SSH key stored in Vault KV at %s/%s", VAULT_KV_MOUNT, self._kv_path(vault_role))
 
-    async def get_kv_status(self) -> dict:
-        resp = await self._client().get(f"/v1/{VAULT_KV_MOUNT}/data/{VAULT_KV_PATH}")
+    async def get_kv_status(self, vault_role: str) -> dict:
+        resp = await self._client().get(f"/v1/{VAULT_KV_MOUNT}/data/{self._kv_path(vault_role)}")
         if resp.status_code == 404:
             return {"stored": False, "has_passphrase": False}
         if resp.status_code != 200:
@@ -136,12 +139,12 @@ class VaultSSHClient:
             "has_passphrase": bool(data.get("passphrase")),
         }
 
-    async def delete_ssh_key(self) -> None:
-        _KV_CACHE.pop(f"{VAULT_KV_MOUNT}/{VAULT_KV_PATH}", None)  # invalidate cache
-        resp = await self._client().delete(f"/v1/{VAULT_KV_MOUNT}/metadata/{VAULT_KV_PATH}")
+    async def delete_ssh_key(self, vault_role: str) -> None:
+        _KV_CACHE.pop(f"{VAULT_KV_MOUNT}/{self._kv_path(vault_role)}", None)
+        resp = await self._client().delete(f"/v1/{VAULT_KV_MOUNT}/metadata/{self._kv_path(vault_role)}")
         if resp.status_code not in (200, 204):
             raise RuntimeError(f"Vault KV delete failed ({resp.status_code}): {resp.text}")
-        log.info("SSH key deleted from Vault KV")
+        log.info("SSH key deleted from Vault KV for role '%s'", vault_role)
 
     # ── Static key mode (dev) ─────────────────────────────────────────────────
     async def _static_key(self) -> str:
@@ -160,12 +163,7 @@ class VaultSSHClient:
                 if resp.status_code != 200:
                     return {"mode": SSH_MODE, "ok": False, "error": f"HTTP {resp.status_code}"}
                 if SSH_MODE == "vault-kv":
-                    status = await self.get_kv_status()
-                    return {
-                        "mode": "vault-kv", "ok": status.get("stored", False),
-                        "url": VAULT_URL, "key_stored": status.get("stored", False),
-                        "has_passphrase": status.get("has_passphrase", False),
-                    }
+                    return {"mode": "vault-kv", "ok": True, "url": VAULT_URL}
                 return {"mode": "vault", "ok": True, "url": VAULT_URL}
             except Exception as e:
                 return {"mode": SSH_MODE, "ok": False, "error": str(e)}

@@ -489,17 +489,24 @@ function AuditView() {
 // ── Settings ──────────────────────────────────────────────────────────────────
 function SettingsView() {
   const {data:health, loading, reload} = useApi(api.health)
+  const {data:hostList} = useApi(api.hosts.list)
   const [tab,   setTab]   = useState('gateway')
   const [saved, setSaved] = useState(false)
   const [env,   setEnv]   = useState({JWT_SECRET:'',JWT_EXPIRE_HOURS:'24',RATE_PROD:'10',RATE_STG:'30',RATE_DEV:'100',SSH_MODE:'key',SSH_KEY_PATH:'~/.ssh/id_rsa',VAULT_URL:'',VAULT_TOKEN:'',VAULT_MOUNT:'ssh',CYBERARK_URL:'',CYBERARK_USERNAME:'',CYBERARK_PASSWORD:'',CYBERARK_SAFE:'',CYBERARK_OBJECT:'',CYBERARK_VERIFY_SSL:'true'})
 
   // Vault KV form state
+  const [kvRole,          setKvRole]          = useState('')
   const [vaultKey,        setVaultKey]        = useState('')
   const [vaultPass,       setVaultPass]       = useState('')
   const [vaultStatus,     setVaultStatus]     = useState(null)  // {stored, has_passphrase}
   const [vaultSaving,     setVaultSaving]     = useState(false)
   const [vaultMsg,        setVaultMsg]        = useState(null)  // {type, text}
   const [showKey,         setShowKey]         = useState(false)
+
+  const kvRoles = useMemo(() => {
+    const roles = [...new Set((hostList||[]).map(h => h.vault_role).filter(Boolean))]
+    return roles.map(r => ({value: r, label: r}))
+  }, [hostList])
 
   // CyberArk PAM state
   const [cyberarkStatus,  setCyberarkStatus]  = useState(null)
@@ -521,8 +528,10 @@ function SettingsView() {
   }, [])
 
   useEffect(() => {
-    if(tab === 'ssh') {
-      api.vault.status().then(s => setVaultStatus(s)).catch(() => setVaultStatus(null))
+    if(tab === 'ssh' && kvRole) {
+      api.vault.status(kvRole).then(s => setVaultStatus(s)).catch(() => setVaultStatus(null))
+    } else if(tab === 'ssh') {
+      setVaultStatus(null)
     }
     if(tab === 'cyberark') {
       api.cyberark.status().then(s => setCyberarkStatus(s)).catch(() => setCyberarkStatus(null))
@@ -530,27 +539,29 @@ function SettingsView() {
     if(tab === 'tokens') {
       loadTokens()
     }
-  }, [tab, loadTokens])
+  }, [tab, kvRole, loadTokens])
 
   const saveVaultKey = async () => {
+    if(!kvRole) { setVaultMsg({type:'error',text:'Sélectionner un rôle avant de stocker la clé'}); return }
     if(!vaultKey.trim()) { setVaultMsg({type:'error',text:'La clé privée est requise'}); return }
     setVaultSaving(true); setVaultMsg(null)
     try {
-      await api.vault.store(vaultKey.trim(), vaultPass || null)
-      setVaultMsg({type:'success',text:'Clé stockée dans Vault avec succès'})
+      await api.vault.store(kvRole, vaultKey.trim(), vaultPass || null)
+      setVaultMsg({type:'success',text:`Clé stockée dans Vault pour le rôle "${kvRole}"`})
       setVaultKey(''); setVaultPass('')
-      const s = await api.vault.status()
+      const s = await api.vault.status(kvRole)
       setVaultStatus(s)
     } catch(e) { setVaultMsg({type:'error',text:e.message}) }
     finally { setVaultSaving(false) }
   }
 
   const deleteVaultKey = async () => {
-    if(!confirm('Supprimer la clé privée du Vault ?')) return
+    if(!kvRole) return
+    if(!confirm(`Supprimer la clé du Vault pour le rôle "${kvRole}" ?`)) return
     try {
-      await api.vault.delete()
+      await api.vault.delete(kvRole)
       setVaultStatus({stored:false, has_passphrase:false})
-      setVaultMsg({type:'success',text:'Clé supprimée du Vault'})
+      setVaultMsg({type:'success',text:`Clé supprimée du Vault pour le rôle "${kvRole}"`})
     } catch(e) { setVaultMsg({type:'error',text:e.message}) }
   }
 
@@ -647,15 +658,28 @@ function SettingsView() {
           </div>}
 
           {env.SSH_MODE==='vault-kv'&&<div style={{display:'flex',flexDirection:'column',gap:16}}>
-            {/* Statut clé stockée */}
-            <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:'14px 18px',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+            {/* Sélecteur de rôle / groupe d'hôtes */}
+            <div style={{display:'flex',flexDirection:'column',gap:6}}>
+              <label style={{fontSize:12,color:C.muted,fontFamily:FUI}}>Vault Role (groupe d'hôtes)</label>
+              {kvRoles.length > 0
+                ? <Sel value={kvRole} onChange={v=>{setKvRole(v);setVaultStatus(null);setVaultMsg(null)}}
+                    options={[{value:'',label:'— Sélectionner un rôle —'},...kvRoles]}/>
+                : <Inp value={kvRole} onChange={v=>{setKvRole(v);setVaultStatus(null);setVaultMsg(null)}} placeholder="ex: prod-ssh, dev-ssh…"/>
+              }
+              {kvRole&&<div style={{fontFamily:FMONO,fontSize:10,color:C.muted}}>
+                Chemin Vault : secret/mcp-gateway/ssh-key/{kvRole}
+              </div>}
+            </div>
+
+            {/* Statut clé pour le rôle sélectionné */}
+            {kvRole&&<div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:'14px 18px',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
               <div style={{display:'flex',alignItems:'center',gap:10}}>
                 {vaultStatus?.stored
                   ? <CheckCircle size={16} color={C.green}/>
                   : <XCircle size={16} color={C.muted}/>}
                 <div>
                   <div style={{fontFamily:FUI,fontWeight:600,fontSize:13,color:vaultStatus?.stored?C.green:C.muted}}>
-                    {vaultStatus?.stored ? 'Clé privée stockée dans Vault' : 'Aucune clé stockée'}
+                    {vaultStatus?.stored ? `Clé présente pour "${kvRole}"` : `Aucune clé pour "${kvRole}"`}
                   </div>
                   {vaultStatus?.stored&&<div style={{fontFamily:FMONO,fontSize:11,color:C.muted,marginTop:2}}>
                     Passphrase : {vaultStatus.has_passphrase ? '●●●●●●' : 'aucune'}
@@ -663,14 +687,14 @@ function SettingsView() {
                 </div>
               </div>
               {vaultStatus?.stored&&<Btn icon={Trash2} variant="danger" small onClick={deleteVaultKey}>Supprimer</Btn>}
-            </div>
+            </div>}
 
             {vaultMsg&&<Alert msg={vaultMsg.text} type={vaultMsg.type}/>}
 
             {/* Formulaire upload clé */}
-            <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:20,display:'flex',flexDirection:'column',gap:14}}>
+            <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:20,display:'flex',flexDirection:'column',gap:14,opacity:kvRole?1:0.5}}>
               <div style={{fontFamily:FUI,fontWeight:700,fontSize:14,color:C.text,display:'flex',alignItems:'center',gap:8}}>
-                <Key size={14} color={C.blue}/>{vaultStatus?.stored ? 'Remplacer la clé' : 'Stocker une clé privée'}
+                <Key size={14} color={C.blue}/>{vaultStatus?.stored ? `Remplacer la clé (${kvRole})` : `Stocker une clé privée${kvRole?' pour '+kvRole:''}`}
               </div>
 
               <div style={{display:'flex',flexDirection:'column',gap:6}}>
@@ -702,7 +726,7 @@ function SettingsView() {
               </div>
 
               <div style={{display:'flex',justifyContent:'flex-end'}}>
-                <Btn icon={Lock} onClick={saveVaultKey} loading={vaultSaving}>Stocker dans Vault</Btn>
+                <Btn icon={Lock} onClick={saveVaultKey} loading={vaultSaving} disabled={!kvRole}>Stocker dans Vault</Btn>
               </div>
             </div>
           </div>}

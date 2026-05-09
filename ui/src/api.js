@@ -85,9 +85,9 @@ export const metrics = () => req('GET', '/metrics/summary')
 
 // ── Vault KV credentials ──────────────────────────────────────────────────────
 export const vault = {
-  store:  (private_key, passphrase) => req('POST',   '/vault/credentials', { body: { private_key, passphrase: passphrase || null } }),
-  status: ()                        => req('GET',    '/vault/credentials/status'),
-  delete: ()                        => req('DELETE', '/vault/credentials'),
+  store:  (vault_role, private_key, passphrase) => req('POST',   '/vault/credentials', { body: { vault_role, private_key, passphrase: passphrase || null } }),
+  status: (vault_role)                          => req('GET',    '/vault/credentials/status', { params: { vault_role } }),
+  delete: (vault_role)                          => req('DELETE', '/vault/credentials', { params: { vault_role } }),
 }
 
 // ── CyberArk PAM ─────────────────────────────────────────────────────────────
