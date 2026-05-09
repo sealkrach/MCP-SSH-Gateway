@@ -201,6 +201,7 @@ function HostsView() {
   const [form,    setForm]    = useState(EMPTY_HOST)
   const [saving,  setSaving]  = useState(false)
   const [formErr, setFormErr] = useState(null)
+  const [testing, setTesting] = useState({})
 
   const filtered = useMemo(() => (hostList||[]).filter(h =>
     (envF==='all'||h.env===envF) && (h.name.includes(search)||h.hostname.includes(search))
@@ -221,6 +222,19 @@ function HostsView() {
     if(!confirm('Supprimer cet hôte ?')) return
     try { await api.hosts.delete(id); reload() }
     catch(e) { alert(e.message) }
+  }
+  const testSsh = async (host) => {
+    setTesting(t => ({...t, [host.id]: {loading: true}}))
+    const t0 = Date.now()
+    try {
+      const res = await api.exec(host.name, 'echo ok', 5)
+      const ms = Date.now() - t0
+      const ok = res.status === 'allowed' && res.exit_code === 0
+      setTesting(t => ({...t, [host.id]: {loading: false, ok, ms, error: ok ? null : (res.reason || res.stderr || 'Échec')}}))
+    } catch(e) {
+      setTesting(t => ({...t, [host.id]: {loading: false, ok: false, ms: Date.now()-t0, error: e.message}}))
+    }
+    setTimeout(() => setTesting(t => { const n={...t}; delete n[host.id]; return n }), 8000)
   }
 
   return (
@@ -266,7 +280,15 @@ function HostsView() {
                 ))}
               </div></td>
               <td style={{padding:'14px 16px'}}><CredBadge mode={sshMode} role={h.vault_role}/></td>
-              <td style={{padding:'14px 16px'}}><div style={{display:'flex',gap:8}}>
+              <td style={{padding:'14px 16px'}}><div style={{display:'flex',gap:8,alignItems:'center'}}>
+                <button onClick={()=>testSsh(h)} title={`Tester SSH sur ${h.name}`} disabled={testing[h.id]?.loading}
+                  style={{background:'none',border:'none',color:C.cyan,cursor:'pointer',padding:4,opacity:testing[h.id]?.loading?0.5:1}}>
+                  {testing[h.id]?.loading
+                    ? <RefreshCw size={14} style={{animation:'spin 1s linear infinite'}}/>
+                    : <Wifi size={14}/>}
+                </button>
+                {testing[h.id]?.ok===true&&<span style={{fontFamily:FMONO,fontSize:10,color:C.green}}>{testing[h.id].ms}ms</span>}
+                {testing[h.id]?.ok===false&&!testing[h.id]?.loading&&<span style={{fontFamily:FMONO,fontSize:10,color:C.red,cursor:'default'}} title={testing[h.id].error}>✗</span>}
                 <button onClick={()=>openEdit(h)} style={{background:'none',border:'none',color:C.muted,cursor:'pointer',padding:4}}><Edit size={14}/></button>
                 <button onClick={()=>del(h.id)} style={{background:'none',border:'none',color:C.red+'aa',cursor:'pointer',padding:4}}><Trash2 size={14}/></button>
               </div></td>
