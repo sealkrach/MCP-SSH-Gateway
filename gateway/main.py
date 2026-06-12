@@ -99,6 +99,14 @@ async def _rate_ok(redis_client, key: str, env: str) -> bool:
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from .auth import JWT_SECRET as _jwt_secret
+    _default = "CHANGE-ME-IN-PROD-32chars-minimum!"
+    if _jwt_secret == _default or len(_jwt_secret) < 32:
+        raise RuntimeError(
+            "JWT_SECRET invalide ou trop court (≥32 caractères requis). "
+            "Définissez la variable d'environnement JWT_SECRET."
+        )
+
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
@@ -133,7 +141,8 @@ async def lifespan(app: FastAPI):
         await app.state.vault.close()
 
 app = FastAPI(title="MCP SSH Gateway", version="2.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+_cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")
+app.add_middleware(CORSMiddleware, allow_origins=_cors_origins, allow_methods=["*"], allow_headers=["*"])
 
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
@@ -446,7 +455,7 @@ if _static.exists():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa_fallback(full_path: str):
-        file = _static / full_path
-        if file.is_file():
+        file = (_static / full_path).resolve()
+        if file.is_relative_to(_static.resolve()) and file.is_file():
             return FileResponse(str(file))
         return FileResponse(str(_static / "index.html"))

@@ -2,10 +2,14 @@
 Auth — JWT statique + API tokens (format: mcp_<64 hex chars>)
 Users définis dans users.json ou ENV GATEWAY_USERS
 """
-import hashlib, json, os, secrets, time, uuid
+import bcrypt as _bcrypt
+import hashlib, json, logging, os, secrets, time, uuid
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger("auth")
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -28,12 +32,21 @@ DEFAULT_USERS = [
     {"username": "dev",    "password": "dev123",    "roles": ["dev"]},
 ]
 
+_default_users_warned = False
+
 def _load_users() -> list[dict]:
+    global _default_users_warned
     if USERS_FILE.exists():
         return json.loads(USERS_FILE.read_text())
     raw = os.getenv("GATEWAY_USERS")
     if raw:
         return json.loads(raw)
+    if not _default_users_warned:
+        log.warning(
+            "SÉCURITÉ: Utilisation des identifiants par défaut (DEFAULT_USERS). "
+            "Définissez USERS_FILE ou GATEWAY_USERS en production."
+        )
+        _default_users_warned = True
     return DEFAULT_USERS
 
 def create_token(username: str, roles: list[str]) -> str:
@@ -47,7 +60,7 @@ def create_token(username: str, roles: list[str]) -> str:
 # ── JWT in-process TTL cache ──────────────────────────────────────────────────
 # Stores decoded payloads keyed by token hash to avoid repeated crypto decode.
 # Per-worker only (not distributed) — intentional: keeps sensitive data local.
-_jwt_cache: dict[str, tuple[dict, float]] = {}  # hash → (payload, exp_ts)
+_jwt_cache: OrderedDict[str, tuple[dict, float]] = OrderedDict()  # hash → (payload, exp_ts)
 _JWT_CACHE_MAX = 2000
 
 def _verify_jwt(token: str) -> dict:
@@ -62,11 +75,10 @@ def _verify_jwt(token: str) -> dict:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
     except JWTError as e:
         raise HTTPException(401, f"Token invalide: {e}")
-    # Evict oldest 10% when cache is full
+    # Evict oldest 10% when cache is full (O(k), not O(n log n))
     if len(_jwt_cache) >= _JWT_CACHE_MAX:
-        oldest = sorted(_jwt_cache, key=lambda k: _jwt_cache[k][1])[:_JWT_CACHE_MAX // 10]
-        for k in oldest:
-            del _jwt_cache[k]
+        for _ in range(_JWT_CACHE_MAX // 10):
+            _jwt_cache.popitem(last=False)
     _jwt_cache[key] = (payload, float(payload.get("exp", time.time() + 3600)))
     return payload
 
@@ -134,11 +146,17 @@ class LoginReq(BaseModel):
     username: str
     password: str
 
+def _check_password(plain: str, stored: str) -> bool:
+    if stored.startswith("$2b$") or stored.startswith("$2a$"):
+        return _bcrypt.checkpw(plain.encode(), stored.encode())
+    # Plaintext fallback — use only during migration; hash passwords with bcrypt
+    log.warning("SÉCURITÉ: Mot de passe en clair détecté. Migrez vers bcrypt ($2b$).")
+    return plain == stored
+
 @router.post("/token")
 async def login(body: LoginReq):
-    user = next((u for u in _load_users()
-                 if u["username"] == body.username and u["password"] == body.password), None)
-    if not user:
+    user = next((u for u in _load_users() if u["username"] == body.username), None)
+    if not user or not _check_password(body.password, user.get("password", "")):
         raise HTTPException(401, "Identifiants incorrects")
     token = create_token(user["username"], user["roles"])
     return {
