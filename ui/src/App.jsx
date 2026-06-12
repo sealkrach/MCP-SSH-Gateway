@@ -962,7 +962,6 @@ function Login({onLogin}) {
             <Inp value={p} onChange={setP} placeholder="••••••••" type="password"/>
           </div>
           <Btn onClick={submit} loading={loading} icon={Lock}>Connexion</Btn>
-          <p style={{fontFamily:FMONO,fontSize:11,color:C.muted,textAlign:'center',marginTop:4}}>admin/admin123 · ops/ops123 · dev/dev123</p>
         </div>
       </div>
     </div>

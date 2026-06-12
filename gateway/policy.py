@@ -1,7 +1,7 @@
 """
 Policy Engine OPA-compatible + routes CRUD
 """
-import json, logging, re, uuid
+import asyncio, json, logging, re, uuid
 from pathlib import Path
 from typing import Optional
 
@@ -52,7 +52,8 @@ class PolicyEngine:
         self._compile()
 
     async def _save(self):
-        POLICY_FILE.write_text(json.dumps(self._rules, indent=2))
+        data = json.dumps(self._rules, indent=2)
+        await asyncio.to_thread(POLICY_FILE.write_text, data)
 
     def get_all(self) -> list[dict]:
         return self._rules
