@@ -23,6 +23,8 @@ services:
       VAULT_MOUNT:       ${VAULT_MOUNT:-ssh}
       VAULT_KV_MOUNT:    ${VAULT_KV_MOUNT:-secret}
       VAULT_KV_PATH:     ${VAULT_KV_PATH:-mcp-gateway/ssh-key}
+      POLICY_PROD_DEFAULT: ${POLICY_PROD_DEFAULT:-deny}
+      CORS_ORIGINS:      ${CORS_ORIGINS:-}
       RATE_PROD:         ${RATE_PROD:-10}
       RATE_STG:          ${RATE_STG:-30}
       RATE_DEV:          ${RATE_DEV:-100}
@@ -108,11 +110,12 @@ services:
     image: hashicorp/vault:1.17
     restart: unless-stopped
     ports:
-      - "8200:8200"
+      - "127.0.0.1:8200:8200"   # loopback uniquement — jamais exposé sur le LAN
     environment:
       VAULT_STABLE_TOKEN: ${VAULT_TOKEN:-dev-only-token}
     volumes:
       - vault_data:/vault/data
+      - vault_init:/vault/init   # clé d'unseal séparée des données chiffrées
       - ./vault/config.hcl:/vault/config/config.hcl:ro
       - ./vault/entrypoint.sh:/entrypoint.sh:ro
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
@@ -159,6 +162,7 @@ volumes:
   pgdata:
   gateway_data:
   vault_data:
+  vault_init:
   prom_data:
   grafana_data:
 

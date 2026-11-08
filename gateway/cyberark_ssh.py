@@ -7,9 +7,10 @@ Le champ vault_role d'un Host encode la référence CyberArk :
   "SSH_Keys_Safe/server01-root"   → safe="SSH_Keys_Safe", object="server01-root"
   "server01-root"                 → safe=CYBERARK_DEFAULT_SAFE, object="server01-root"
 """
-import asyncio, logging, os, tempfile, time
+import asyncio, logging, os, time
 from typing import Optional, Tuple
 
+import asyncssh
 import httpx
 
 log = logging.getLogger("cyberark")
@@ -101,9 +102,9 @@ class CyberArkSSHClient:
 
     async def get_credential(
         self, vault_role: str, username: str
-    ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-        """Retourne (key_path, cert_path, passphrase, password).
-        key_path non-None → auth par clé ; password non-None → auth par mot de passe."""
+    ) -> Tuple[Optional[list], Optional[str]]:
+        """Retourne (client_keys, password) pour asyncssh.
+        client_keys non-None → auth par clé (en mémoire) ; password non-None → auth par mot de passe."""
         safe, obj = _parse_role(vault_role)
         data = await self._fetch(safe, obj)
         return self._parse_credential(data)
@@ -226,12 +227,10 @@ class CyberArkSSHClient:
 
     # ── Parsing du credential ─────────────────────────────────────────────────
 
-    def _parse_credential(
-        self, data: dict
-    ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    def _parse_credential(self, data: dict) -> Tuple[Optional[list], Optional[str]]:
         """
         Détecte le type de credential retourné par CyberArk :
-        - PEM (-----BEGIN ...) → clé privée SSH, écrite dans un fichier temp
+        - PEM (-----BEGIN ...) → clé privée SSH, importée EN MÉMOIRE (jamais sur disque)
         - Autre               → mot de passe SSH
         """
         content = data.get("Content", "")
@@ -239,13 +238,13 @@ class CyberArkSSHClient:
             raise RuntimeError("CyberArk a renvoyé un credential vide")
 
         if content.strip().startswith("-----BEGIN"):
-            kf = tempfile.NamedTemporaryFile(delete=False, suffix=".key", mode="w")
-            kf.write(content)
-            kf.close()
-            os.chmod(kf.name, 0o600)
             passphrase = data.get("passphrase") or None
+            try:
+                key = asyncssh.import_private_key(content, passphrase=passphrase)
+            except Exception as e:
+                raise RuntimeError(f"Clé privée CyberArk illisible (format ou passphrase): {type(e).__name__}")
             log.debug("CyberArk: credential type=ssh-key user=%s", data.get("UserName", ""))
-            return kf.name, None, passphrase, None
+            return [key], None
         else:
             log.debug("CyberArk: credential type=password user=%s", data.get("UserName", ""))
-            return None, None, None, content
+            return None, content

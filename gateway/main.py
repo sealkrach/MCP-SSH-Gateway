@@ -147,7 +147,13 @@ async def lifespan(app: FastAPI):
         await app.state.vault.close()
 
 app = FastAPI(title="MCP SSH Gateway", version="2.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# CORS : l'UI est servie par le gateway lui-même (même origine) — le CORS n'est
+# nécessaire que si l'UI est hébergée ailleurs. Jamais de wildcard.
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(CORSMiddleware, allow_origins=_cors_origins,
+                       allow_methods=["*"], allow_headers=["Authorization", "Content-Type"])
 
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
@@ -280,31 +286,40 @@ async def exec_cmd(body: ExecReq, req: Request, user=Depends(current_user), db: 
 
     # 2. Rate limit
     if not await _rate_ok(req.app.state.redis, f"rl:{username}:{host.name}", host.env):
-        return {"status": "denied", "reason": f"Rate limit: max {RATE_LIMITS.get(host.env,30)} cmd/min en {host.env}"}
+        reason = f"Rate limit: max {RATE_LIMITS.get(host.env,30)} cmd/min en {host.env}"
+        await _audit(db, sid, username, host, body.command, "denied", reason, None, None, 0, "rate-limit")
+        CMD_TOTAL.labels(env=host.env, status="denied").inc()
+        return {"status": "denied", "reason": reason}
 
     # 3. Policy
-    pol = await req.app.state.policies.evaluate({"host_env": host.env, "command": body.command, "user": username, "roles": list(user_roles)})
+    pol = await req.app.state.policies.evaluate(
+        {"host_env": host.env, "command": body.command, "user": username, "roles": list(user_roles)}, db)
     if pol["action"] == "deny":
         await _audit(db, sid, username, host, body.command, "denied", pol["reason"], None, None, 0, pol.get("policy_id"))
         DENY_CNT.labels(env=host.env, policy=pol.get("policy_id","?")).inc()
         CMD_TOTAL.labels(env=host.env, status="denied").inc()
         return {"status": "denied", "reason": pol["reason"]}
 
-    # 4. SSH credential (Vault cert, Vault KV, clé statique ou CyberArk)
+    # 4. SSH credential (Vault cert, Vault KV, clé statique ou CyberArk) — en mémoire
     try:
-        key_path, cert_path, passphrase, password = await req.app.state.vault.get_credential(host.vault_role, username)
+        client_keys, password = await req.app.state.vault.get_credential(host.vault_role, username)
     except Exception as e:
-        raise HTTPException(500, f"Credential SSH error: {e}")
+        # Détail loggé côté serveur uniquement (peut contenir URLs/réponses internes)
+        log.error("Credential SSH role=%s host=%s: %s", host.vault_role, host.name, e)
+        raise HTTPException(500, "Impossible de récupérer le credential SSH — voir les logs serveur")
 
     # 5. Host key (épinglage anti-MITM) puis exec
     try:
         known_hosts = await _resolve_known_hosts(host, db)
-    except HTTPException:
+    except HTTPException as e:
+        await _audit(db, sid, username, host, body.command, "denied", f"Host key: {e.detail}", None, None, 0, "host-key")
+        CMD_TOTAL.labels(env=host.env, status="denied").inc()
         raise
     except Exception as e:
         log.error("Host key %s: %s", host.name, e)
+        await _audit(db, sid, username, host, body.command, "error", "Clé d'hôte irrécupérable", None, None, 0, "host-key")
         CMD_TOTAL.labels(env=host.env, status="error").inc()
-        return {"status": "error", "reason": f"Clé d'hôte irrécupérable pour '{host.name}': {e}"}
+        return {"status": "error", "reason": f"Clé d'hôte irrécupérable pour '{host.name}'"}
 
     SESS_GAUGE.inc()
     stdout = stderr = ""; exit_code = -1
@@ -313,15 +328,14 @@ async def exec_cmd(body: ExecReq, req: Request, user=Depends(current_user), db: 
             host=host.hostname, port=host.port, username=host.ssh_user,
             known_hosts=known_hosts, connect_timeout=10,
         )
-        if key_path:
-            conn_kwargs["client_keys"] = [key_path]
-            if cert_path:
-                conn_kwargs["cert_file"] = cert_path
-            if passphrase:
-                conn_kwargs["passphrase"] = passphrase
+        if client_keys:
+            conn_kwargs["client_keys"] = client_keys
         elif password:
             conn_kwargs["password"] = password
             conn_kwargs["preferred_auth"] = ["password"]
+        else:
+            CMD_TOTAL.labels(env=host.env, status="error").inc()
+            return {"status": "error", "reason": "Aucun credential SSH disponible pour cet hôte"}
 
         async with asyncssh.connect(**conn_kwargs) as conn:
             result = await asyncio.wait_for(conn.run(body.command, check=False), timeout=body.timeout)
@@ -331,16 +345,17 @@ async def exec_cmd(body: ExecReq, req: Request, user=Depends(current_user), db: 
     except asyncio.TimeoutError:
         CMD_TOTAL.labels(env=host.env, status="error").inc()
         return {"status": "error", "reason": f"Timeout {body.timeout}s"}
-    except Exception as e:
+    except (asyncssh.Error, OSError) as e:
+        # Erreurs liées à l'hôte cible (connexion refusée, host key mismatch…) : utiles au client
         log.error("SSH exec %s: %s", host.name, e)
         CMD_TOTAL.labels(env=host.env, status="error").inc()
-        return {"status": "error", "reason": str(e)}
+        return {"status": "error", "reason": f"SSH: {e}"}
+    except Exception as e:
+        log.error("SSH exec %s (interne): %s", host.name, e, exc_info=True)
+        CMD_TOTAL.labels(env=host.env, status="error").inc()
+        return {"status": "error", "reason": "Erreur interne — voir les logs serveur"}
     finally:
         SESS_GAUGE.dec()
-        import os as _os, tempfile as _tmp
-        for p in [key_path, cert_path]:
-            if p and _os.path.exists(p) and p.startswith(_tmp.gettempdir()):
-                _os.unlink(p)
 
     ms   = int(time.time() * 1000) - start
     h256 = hashlib.sha256(stdout.encode()).hexdigest()
@@ -363,9 +378,13 @@ async def get_audit(
     user=Depends(current_user), db: AsyncSession = Depends(get_db),
 ):
     q = select(AuditLog).order_by(AuditLog.timestamp.desc()).limit(min(limit, 500))
+    # Non-admin : uniquement ses propres entrées (les commandes des autres peuvent contenir des secrets)
+    if "admin" not in user["roles"]:
+        q = q.where(AuditLog.user == user["sub"])
+    elif user_filter:
+        q = q.where(AuditLog.user == user_filter)
     if env:         q = q.where(AuditLog.host_env == env)
     if status:      q = q.where(AuditLog.status == status)
-    if user_filter: q = q.where(AuditLog.user == user_filter)
     rows = (await db.execute(q)).scalars().all()
     return [{
         "id": r.id, "session_id": r.session_id,
@@ -448,8 +467,12 @@ async def store_vault_credentials(body: VaultCredentials, req: Request, user=Dep
     try:
         await req.app.state.vault.store_ssh_key(body.vault_role, body.private_key, body.passphrase)
         return {"stored": True, "vault_role": body.vault_role}
-    except Exception as e:
+    except RuntimeError as e:
+        # Messages contrôlés par notre code (clé invalide, Vault KO) — pas de corps de réponse interne
         raise HTTPException(500, str(e))
+    except Exception as e:
+        log.error("Vault KV store %s: %s", body.vault_role, e)
+        raise HTTPException(500, "Erreur Vault KV — voir les logs serveur")
 
 @app.get("/vault/credentials/status")
 async def vault_credentials_status(vault_role: str, req: Request, user=Depends(current_user)):
@@ -457,7 +480,8 @@ async def vault_credentials_status(vault_role: str, req: Request, user=Depends(c
     try:
         return await req.app.state.vault.get_kv_status(vault_role)
     except Exception as e:
-        raise HTTPException(500, str(e))
+        log.error("Vault KV status %s: %s", vault_role, e)
+        raise HTTPException(500, "Erreur Vault KV — voir les logs serveur")
 
 @app.delete("/vault/credentials")
 async def delete_vault_credentials(vault_role: str, req: Request, user=Depends(require_admin)):
@@ -465,8 +489,11 @@ async def delete_vault_credentials(vault_role: str, req: Request, user=Depends(r
     try:
         await req.app.state.vault.delete_ssh_key(vault_role)
         return {"deleted": True, "vault_role": vault_role}
-    except Exception as e:
+    except RuntimeError as e:
         raise HTTPException(500, str(e))
+    except Exception as e:
+        log.error("Vault KV delete %s: %s", vault_role, e)
+        raise HTTPException(500, "Erreur Vault KV — voir les logs serveur")
 
 # ── Routes: CyberArk PAM ──────────────────────────────────────────────────────
 class CyberArkTestRequest(BaseModel):
@@ -479,6 +506,9 @@ class CyberArkTestRequest(BaseModel):
 
 @app.post("/cyberark/test")
 async def cyberark_test(body: CyberArkTestRequest, user=Depends(require_admin)):
+    # Anti-SSRF : le gateway POSTe des credentials vers cette URL — HTTPS obligatoire
+    if not body.url.lower().startswith("https://") and os.getenv("CYBERARK_ALLOW_HTTP", "false").lower() != "true":
+        raise HTTPException(422, "URL CyberArk en HTTPS requise (CYBERARK_ALLOW_HTTP=true pour forcer en lab)")
     result = await test_cyberark_connection(
         body.url, body.username, body.password,
         body.safe, body.object_name, body.verify_ssl,

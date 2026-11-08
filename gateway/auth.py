@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import bcrypt
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from pydantic import BaseModel
@@ -173,11 +173,56 @@ class LoginReq(BaseModel):
     username: str
     password: str
 
+# ── Anti brute-force ──────────────────────────────────────────────────────────
+LOGIN_MAX_FAILS       = int(os.getenv("LOGIN_MAX_FAILS", "5"))
+LOGIN_LOCKOUT_SECONDS = int(os.getenv("LOGIN_LOCKOUT_SECONDS", "900"))
+# Hash factice : coût bcrypt identique quand l'utilisateur n'existe pas
+# (anti-énumération par timing)
+_DUMMY_HASH = bcrypt.hashpw(secrets.token_bytes(16), bcrypt.gensalt())
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "?"
+
 @router.post("/token")
-async def login(body: LoginReq):
+async def login(body: LoginReq, request: Request):
+    rds = getattr(request.app.state, "redis", None)
+    lock_key = f"login_fail:{body.username}:{_client_ip(request)}"
+    if rds:
+        try:
+            if int(await rds.get(lock_key) or 0) >= LOGIN_MAX_FAILS:
+                raise HTTPException(429, f"Trop de tentatives — réessayer dans {LOGIN_LOCKOUT_SECONDS // 60} min")
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # Redis indisponible — on n'empêche pas le login légitime
+
     user = next((u for u in _load_users() if u["username"] == body.username), None)
-    if not user or not _check_password(user, body.password):
+    if user:
+        ok = _check_password(user, body.password)
+    else:
+        bcrypt.checkpw(body.password.encode(), _DUMMY_HASH)  # timing constant
+        ok = False
+
+    if not ok:
+        if rds:
+            try:
+                pipe = rds.pipeline()
+                pipe.incr(lock_key)
+                pipe.expire(lock_key, LOGIN_LOCKOUT_SECONDS)
+                await pipe.execute()
+            except Exception:
+                pass
+        log.warning("Login échoué: user=%s ip=%s", body.username, _client_ip(request))
         raise HTTPException(401, "Identifiants incorrects")
+
+    if rds:
+        try:
+            await rds.delete(lock_key)
+        except Exception:
+            pass
     token = create_token(user["username"], user["roles"])
     return {
         "access_token": token, "token_type": "bearer",

@@ -7,7 +7,7 @@ A self-hosted SSH gateway that lets Claude execute commands on your servers thro
 - **MCP integration** — Claude can list hosts, run commands, and read audit logs via `ssh_exec`, `ssh_list_hosts`, `ssh_audit`
 - **Vault KV** — SSH private key and passphrase stored encrypted in Vault, retrieved at connection time
 - **Vault SSH CA** — Alternatively, generate ephemeral ED25519 certificates (TTL 5 min) signed by Vault
-- **Policy engine** — Regex-based rules (block `rm -rf`, `sudo`, interactive shells, etc.) applied before every exec
+- **Policy engine** — Regex rules stored in the database (shared across workers), evaluated deny > warn > allow; production runs as an **allow-list** by default
 - **Audit log** — Immutable per-command log with SHA-256 stdout hash, duration, exit code, deny reason
 - **RBAC** — JWT-based roles (`admin`, `ops`, `sre`, `dev`) scoped per host
 - **Host key pinning** — SSH host keys verified against pinned keys (strict / TOFU), MITM-resistant
@@ -142,7 +142,7 @@ DELETE /hosts/{id}        Disable host (admin)
 
 POST /exec                Execute SSH command
 
-GET  /policies            List policies
+GET  /policies            List policies (admin)
 POST /policies            Create policy (admin)
 PUT  /policies/{id}       Update policy (admin)
 DELETE /policies/{id}     Delete policy (admin)
@@ -151,7 +151,7 @@ POST /vault/credentials           Store SSH key in Vault (admin)
 GET  /vault/credentials/status    Check if key is stored
 DELETE /vault/credentials         Remove key from Vault (admin)
 
-GET  /audit               Audit log (filterable)
+GET  /audit               Audit log (admins see all; others see only their own entries)
 GET  /metrics/summary     Dashboard metrics
 GET  /metrics/prometheus  Prometheus scrape endpoint
 GET  /health              Health + Vault status
@@ -169,6 +169,10 @@ All settings via `.env` (see `.env.example`):
 | `DB_PASSWORD` | — | PostgreSQL password (**required**) |
 | `SSH_MODE` | `key` | `key` / `vault-kv` / `vault` / `cyberark` |
 | `SSH_HOST_KEY_POLICY` | `strict` | `strict` / `tofu` / `insecure` — host key verification (compose default: `tofu`) |
+| `POLICY_PROD_DEFAULT` | `deny` | `deny` = production is an allow-list; `allow` = legacy fail-open |
+| `CORS_ORIGINS` | — | Comma-separated allowed origins; empty = no CORS (UI is same-origin) |
+| `LOGIN_MAX_FAILS` | `5` | Failed logins per user+IP before lockout |
+| `LOGIN_LOCKOUT_SECONDS` | `900` | Lockout duration |
 | `VAULT_URL` | `http://vault:8200` | Vault address |
 | `VAULT_TOKEN` | `dev-only-token` | Vault root/service token |
 | `VAULT_KV_MOUNT` | `secret` | Vault KV v2 mount |
@@ -217,18 +221,15 @@ Each host's public key is pinned in the `host_key` field (authorized_keys format
 
 Get a host's key with `ssh-keyscan -t ed25519 <hostname>` and set it via `PUT /hosts/{id}`.
 
-## Default policies
+## Policies
 
-Out-of-the-box rules that block dangerous commands:
+Rules are stored in the **database** (shared by all workers; a `policies.json` from older versions is imported automatically on first start). Evaluation order is **deny > warn > allow** — a deny rule can never be masked by an allow rule.
 
-- `rm -rf` — critical, all envs
-- `sudo` — high, all envs
-- Interactive shells (`bash`, `sh`, `zsh`) — high, production
-- Direct DB access (`psql`, `mysql`, `mongosh`) — critical, production
-- `curl … | bash` — critical, all envs
-- `chmod 777` — high, all envs
+**Production is an allow-list by default** (`POLICY_PROD_DEFAULT=deny`): a command that matches no `allow` rule is refused. Staging and development stay fail-open. Set `POLICY_PROD_DEFAULT=allow` to restore the legacy behavior (regex blacklists are easy to bypass — not recommended).
 
-All rules are editable in the UI (Policies tab) or via the API.
+Default deny rules: `rm -rf` (and variants), `sudo`/`su`, interactive shells, direct DB access, `curl|bash`, `chmod 777`, reboot/shutdown. One default `allow` rule covers common read-only ops (`df`, `ls`, `cat`, `ps`, `systemctl status`, …).
+
+Rules are editable in the UI (Policies tab, **admin only** — deny patterns reveal how to evade them) or via the API. Changes propagate to other workers within ~10 s (`POLICY_CACHE_TTL`).
 
 ## Kubernetes
 
@@ -249,5 +250,9 @@ helm upgrade --install mcp-ssh ./helm \
 - The gateway refuses to start if `JWT_SECRET` is missing, shorter than 32 chars, or equal to a published example value.
 - Demo accounts are disabled unless `ALLOW_DEFAULT_USERS=true` — never enable it outside a local demo.
 - Keep `SSH_HOST_KEY_POLICY=strict` (or at least `tofu`) in production; `insecure` disables MITM protection.
-- The dev-mode Vault token (`dev-only-token`) is public — replace with a real token in production, don't expose port 8200, and use a scoped policy instead of root.
+- Keep `POLICY_PROD_DEFAULT=deny` — production allow-list. Regex deny rules alone are bypassable.
+- Login is locked for 15 min after 5 failures per user+IP (Redis-backed).
+- Private keys from Vault KV / Vault CA / CyberArk are handled **in memory only** (never written to disk).
+- The dev-mode Vault token (`dev-only-token`) is now scoped (own KV subtree + SSH signing, not root) and port 8200 binds to localhost only — still replace it with a real token in production.
+- Nginx sends security headers (CSP, nosniff, frame deny); terminate TLS in front and enable HSTS for any non-local deployment.
 - `SSH_MODE=key` mounts your host SSH key into the container — use `vault-kv` or `vault` in production.
