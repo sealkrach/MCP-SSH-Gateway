@@ -1,6 +1,12 @@
 # MCP SSH Gateway
 
-A self-hosted SSH gateway that lets Claude execute commands on your servers through the Model Context Protocol (MCP). Private keys are stored in HashiCorp Vault. Every command is audited, rate-limited, and filtered by OPA-compatible policies.
+A self-hosted SSH gateway that lets Claude execute commands on your servers through the Model Context Protocol (MCP). Private keys are stored in HashiCorp Vault or CyberArk and handled in memory only. Every command is authenticated, rate-limited, filtered by policies (production runs as an allow-list), verified against pinned host keys, and audited.
+
+![Dashboard](docs/screenshots/dashboard.png)
+*Dashboard — 24h activity, policy denials and per-environment breakdown.*
+
+![Host Registry](docs/screenshots/hosts.png)
+*Host Registry — hosts scoped by environment, SSH user, roles and credential backend.*
 
 ## Features
 
@@ -21,14 +27,27 @@ A self-hosted SSH gateway that lets Claude execute commands on your servers thro
 Claude Code
     │  MCP stdio (server.py)
     ▼
-mcp_server ──HTTP──► gateway (FastAPI)
-                         │
-                 ┌───────┼───────┐
-                 │       │       │
-              Vault   Postgres  asyncssh
-              (KV +   (hosts,   (SSH exec)
-              SSH CA)  audit)
+mcp_server ──HTTP──► nginx ──► gateway (FastAPI, N workers)
+                                  │
+                      ┌───────────┼─────────┬──────────┐
+                      │           │         │          │
+                   Vault or    Postgres   Redis     asyncssh
+                   CyberArk    (hosts,    (rate      (SSH exec,
+                   (creds,     policies,  limits,    host key
+                   SSH CA)     audit)     lockout)   pinning)
 ```
+
+### How a command is executed
+
+Every `POST /exec` goes through this pipeline — each step can refuse the command, and every refusal is logged in the audit trail:
+
+1. **Authentication** — JWT (24 h) or API token (`mcp_…`, SHA-256 hashed in DB, revocable)
+2. **RBAC** — the user's roles must intersect the host's `allowed_roles` (admins bypass)
+3. **Rate limit** — Redis sliding window per user × host × environment (10/30/100 cmd/min for prod/staging/dev)
+4. **Policies** — regex rules from the DB, evaluated **deny > warn > allow**; in production, no matching `allow` rule means **deny** (allow-list)
+5. **Host key** — the server's SSH key must match the pinned `host_key` (strict), be pinned on first use (tofu), or the command is refused
+6. **Credential** — fetched from Vault KV / Vault SSH CA / CyberArk / static key, kept **in memory only**
+7. **Exec + audit** — command runs with a bounded timeout (1–600 s); user, command, exit code, duration and a SHA-256 of stdout are recorded
 
 ## Quick start
 
@@ -246,6 +265,53 @@ helm upgrade --install mcp-ssh ./helm \
 ```
 
 `gatewayUsers` is required to be able to log in (demo accounts are disabled by default); generate the bcrypt hash with `python -m gateway.hash_password`. The chart defaults to `SSH_HOST_KEY_POLICY=strict` and `POLICY_PROD_DEFAULT=deny`.
+
+## Local development (without Docker)
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# Terminal 1 — gateway API on :8080 (SQLite, demo accounts, TOFU host keys)
+export JWT_SECRET=$(openssl rand -hex 32)
+export ALLOW_DEFAULT_USERS=true SSH_HOST_KEY_POLICY=tofu
+uvicorn gateway.main:app --port 8080 --reload
+
+# Terminal 2 — React UI on :5173 (proxies /api → :8080)
+cd ui && npm ci && npm run dev
+```
+
+Redis and Vault are optional in dev: without Redis the rate limiter and login lockout fall back gracefully; `SSH_MODE=key` uses a local private key (`SSH_KEY_PATH`).
+
+## Project structure
+
+```
+gateway/            FastAPI backend
+  main.py           App, hosts CRUD, /exec pipeline, audit, metrics, SPA
+  auth.py           JWT + API tokens, bcrypt users, login lockout
+  policy.py         DB-backed policy engine (deny > warn > allow)
+  vault_ssh.py      Vault KV / Vault SSH CA credential provider (in-memory keys)
+  cyberark_ssh.py   CyberArk CCP / PVWA credential provider
+  hash_password.py  bcrypt hash helper (python -m gateway.hash_password)
+  db.py             Async SQLAlchemy engine/session
+mcp_server/         MCP stdio server for Claude Code (ssh_exec, ssh_list_hosts, ssh_audit)
+ui/                 React + Vite single-page app
+helm/               Kubernetes chart
+vault/              Vault dev-mode config + auto-init/unseal entrypoint
+```
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| Gateway exits at startup with `JWT_SECRET manquant…` | Set a real `JWT_SECRET` (`openssl rand -hex 32`) in `.env` |
+| `401 Identifiants incorrects` on a fresh install | No users configured: create `users.json` / `GATEWAY_USERS`, or set `ALLOW_DEFAULT_USERS=true` for a local demo |
+| `429 Trop de tentatives` | Login lockout (5 fails/15 min per user+IP, 20 per user) — wait or flush the `login_fail:*` keys in Redis |
+| `/exec` returns **428** | `SSH_HOST_KEY_POLICY=strict` and the host has no pinned key: set `host_key` (`ssh-keyscan -t ed25519 <host>`) or switch to `tofu` |
+| `/exec` denied with *“Production en mode allow-list”* | Expected: prod only runs commands matching an `allow` rule — add one, or set `POLICY_PROD_DEFAULT=allow` |
+| Policies tab shows 403 | Policy management is admin-only by design |
+| A policy change doesn't apply immediately | Worker caches refresh within ~10 s (`POLICY_CACHE_TTL`) |
+| Host key changed legitimately (server reinstalled) | Update `host_key` via `PUT /hosts/{id}` with the new public key |
 
 ## Security notes
 
