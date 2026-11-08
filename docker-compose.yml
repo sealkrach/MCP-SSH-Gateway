@@ -14,7 +14,9 @@ services:
       DATABASE_URL:      postgresql+asyncpg://gateway:${DB_PASSWORD}@postgres:5432/mcp_ssh
       JWT_SECRET:        ${JWT_SECRET}
       JWT_EXPIRE_HOURS:  ${JWT_EXPIRE_HOURS:-24}
+      ALLOW_DEFAULT_USERS: ${ALLOW_DEFAULT_USERS:-false}
       SSH_MODE:          ${SSH_MODE:-key}
+      SSH_HOST_KEY_POLICY: ${SSH_HOST_KEY_POLICY:-tofu}
       SSH_KEY_PATH:      /run/secrets/ssh_key
       VAULT_URL:         ${VAULT_URL:-http://vault:8200}
       VAULT_TOKEN:       ${VAULT_TOKEN:-dev-only-token}

@@ -10,6 +10,7 @@ A self-hosted SSH gateway that lets Claude execute commands on your servers thro
 - **Policy engine** — Regex-based rules (block `rm -rf`, `sudo`, interactive shells, etc.) applied before every exec
 - **Audit log** — Immutable per-command log with SHA-256 stdout hash, duration, exit code, deny reason
 - **RBAC** — JWT-based roles (`admin`, `ops`, `sre`, `dev`) scoped per host
+- **Host key pinning** — SSH host keys verified against pinned keys (strict / TOFU), MITM-resistant
 - **Rate limiting** — Per-user, per-host, per-environment (separate limits for prod / staging / dev)
 - **React UI** — Dashboard, host registry, policy editor, audit viewer, SSH credential management
 - **Observability** — Prometheus metrics, pre-wired Grafana stack
@@ -36,7 +37,11 @@ git clone https://github.com/sealkrach/MCP-SSH-Gateway
 cd MCP-SSH-Gateway
 
 cp .env.example .env
-# Edit .env — set JWT_SECRET (32+ chars) and DB_PASSWORD at minimum
+# Edit .env — required:
+#   JWT_SECRET   → openssl rand -hex 32   (the gateway refuses to start without it)
+#   DB_PASSWORD  → any strong password
+# For a local demo you can enable the built-in demo accounts:
+#   ALLOW_DEFAULT_USERS=true
 
 docker compose up --build -d
 ```
@@ -49,7 +54,8 @@ docker compose up --build -d
 | Prometheus | http://localhost:9090  |
 | Grafana    | http://localhost:3001  |
 
-Default login: `admin / admin123`
+Demo login (only if `ALLOW_DEFAULT_USERS=true`): `admin / admin123`.
+For anything beyond a local demo, create real users — see [Users](#users).
 
 ## SSH modes
 
@@ -86,6 +92,13 @@ Mounts `~/.ssh/id_rsa` from the host. Set `SSH_MODE=key` (default).
 ## Connecting Claude Code
 
 ```bash
+# Recommended: create an API token in the UI (API Tokens tab) and use MCP_SSH_TOKEN
+claude mcp add ssh-gateway \
+  -e MCP_SSH_GATEWAY_URL=http://localhost:8080 \
+  -e MCP_SSH_TOKEN=mcp_... \
+  -- python3 /path/to/MCP-SSH-Gateway/mcp_server/server.py
+
+# Or with username/password (demo accounts need ALLOW_DEFAULT_USERS=true)
 claude mcp add ssh-gateway \
   -e MCP_SSH_GATEWAY_URL=http://localhost:8080 \
   -e MCP_SSH_USER=admin \
@@ -150,10 +163,12 @@ All settings via `.env` (see `.env.example`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `JWT_SECRET` | — | Secret key for JWT signing (32+ chars, **required**) |
+| `JWT_SECRET` | — | Secret key for JWT signing (32+ chars, **required** — startup fails otherwise) |
 | `JWT_EXPIRE_HOURS` | `24` | Token lifetime |
+| `ALLOW_DEFAULT_USERS` | `false` | `true` enables the demo accounts (local dev only) |
 | `DB_PASSWORD` | — | PostgreSQL password (**required**) |
-| `SSH_MODE` | `key` | `key` / `vault-kv` / `vault` |
+| `SSH_MODE` | `key` | `key` / `vault-kv` / `vault` / `cyberark` |
+| `SSH_HOST_KEY_POLICY` | `strict` | `strict` / `tofu` / `insecure` — host key verification (compose default: `tofu`) |
 | `VAULT_URL` | `http://vault:8200` | Vault address |
 | `VAULT_TOKEN` | `dev-only-token` | Vault root/service token |
 | `VAULT_KV_MOUNT` | `secret` | Vault KV v2 mount |
@@ -164,7 +179,27 @@ All settings via `.env` (see `.env.example`):
 | `GATEWAY_PORT` | `8080` | Gateway API port |
 | `UI_PORT` | `3000` | UI port |
 
-## Default users
+## Users
+
+Define users in a `users.json` file (or the `GATEWAY_USERS` env var, same JSON format) with **bcrypt-hashed** passwords:
+
+```bash
+python -m gateway.hash_password
+# → $2b$12$...
+```
+
+```json
+[
+  {"username": "admin", "password_hash": "$2b$12$...", "roles": ["admin", "ops", "sre", "dev"]},
+  {"username": "ops",   "password_hash": "$2b$12$...", "roles": ["ops", "sre"]}
+]
+```
+
+A plaintext `"password"` field is still accepted for local dev, but logs a warning — use `password_hash`.
+
+### Demo accounts (opt-in)
+
+With `ALLOW_DEFAULT_USERS=true` and no `users.json`/`GATEWAY_USERS`, these demo accounts are active. **Never enable in production.**
 
 | Username | Password | Roles |
 |----------|----------|-------|
@@ -172,7 +207,15 @@ All settings via `.env` (see `.env.example`):
 | `ops` | `ops123` | ops, sre |
 | `dev` | `dev123` | dev |
 
-Customize by creating a `users.json` file or setting the `GATEWAY_USERS` env var (JSON array).
+## SSH host key verification
+
+Each host's public key is pinned in the `host_key` field (authorized_keys format). `SSH_HOST_KEY_POLICY` controls the behavior:
+
+- `strict` (default) — exec is refused (HTTP 428) until a `host_key` is set for the host
+- `tofu` — the key is fetched and pinned on first exec (docker-compose default); later changes are rejected
+- `insecure` — no verification (local dev only, logs a warning)
+
+Get a host's key with `ssh-keyscan -t ed25519 <hostname>` and set it via `PUT /hosts/{id}`.
 
 ## Default policies
 
@@ -203,6 +246,8 @@ helm upgrade --install mcp-ssh ./helm \
 ## Security notes
 
 - **Never commit `.env`** — it is in `.gitignore`. Use secrets management in production.
-- Change default passwords before any internet-facing deployment.
-- The dev-mode Vault token (`dev-only-token`) is public — replace with a real token in production.
+- The gateway refuses to start if `JWT_SECRET` is missing, shorter than 32 chars, or equal to a published example value.
+- Demo accounts are disabled unless `ALLOW_DEFAULT_USERS=true` — never enable it outside a local demo.
+- Keep `SSH_HOST_KEY_POLICY=strict` (or at least `tofu`) in production; `insecure` disables MITM protection.
+- The dev-mode Vault token (`dev-only-token`) is public — replace with a real token in production, don't expose port 8200, and use a scoped policy instead of root.
 - `SSH_MODE=key` mounts your host SSH key into the container — use `vault-kv` or `vault` in production.

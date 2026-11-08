@@ -1,12 +1,15 @@
 """
 Auth — JWT statique + API tokens (format: mcp_<64 hex chars>)
 Users définis dans users.json ou ENV GATEWAY_USERS
+Mots de passe : bcrypt via champ "password_hash" (le champ "password" en clair
+reste accepté pour le dev, avec warning).
 """
-import hashlib, json, os, secrets, time, uuid
+import hashlib, json, logging, os, secrets, time, uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import bcrypt
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
@@ -16,11 +19,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db import Base, get_db
 
-JWT_SECRET     = os.getenv("JWT_SECRET", "CHANGE-ME-IN-PROD-32chars-minimum!")
+log = logging.getLogger("auth")
+
+# ── JWT secret : fail-fast si absent ou non sécurisé ──────────────────────────
+_KNOWN_BAD_SECRETS = {
+    "CHANGE-ME-IN-PROD-32chars-minimum!",
+    "CHANGE-ME-minimum-32-characters-secret",
+}
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+if not JWT_SECRET or JWT_SECRET in _KNOWN_BAD_SECRETS or len(JWT_SECRET) < 32:
+    raise RuntimeError(
+        "JWT_SECRET manquant, trop court (<32 caractères) ou égal à une valeur d'exemple publiée. "
+        "Générer un secret aléatoire : openssl rand -hex 32"
+    )
+
 JWT_ALGO       = "HS256"
 JWT_EXPIRE_H   = int(os.getenv("JWT_EXPIRE_HOURS", "24"))
 USERS_FILE     = Path(os.getenv("USERS_FILE", "./users.json"))
 
+# Comptes de démo — uniquement si ALLOW_DEFAULT_USERS=true (jamais en prod)
+ALLOW_DEFAULT_USERS = os.getenv("ALLOW_DEFAULT_USERS", "false").lower() == "true"
 DEFAULT_USERS = [
     {"username": "admin",  "password": "admin123",  "roles": ["admin", "ops", "sre", "dev"]},
     {"username": "sylvain","password": "sylvain123","roles": ["admin", "ops", "sre"]},
@@ -34,7 +52,28 @@ def _load_users() -> list[dict]:
     raw = os.getenv("GATEWAY_USERS")
     if raw:
         return json.loads(raw)
-    return DEFAULT_USERS
+    if ALLOW_DEFAULT_USERS:
+        log.warning("ALLOW_DEFAULT_USERS=true — comptes de démo actifs (admin/admin123…). Ne JAMAIS utiliser en production.")
+        return DEFAULT_USERS
+    log.error("Aucun utilisateur configuré — créer users.json ou définir GATEWAY_USERS "
+              "(hash bcrypt via: python -m gateway.hash_password)")
+    return []
+
+def _check_password(user: dict, password: str) -> bool:
+    """password_hash (bcrypt) prioritaire ; 'password' en clair toléré en dev avec warning."""
+    h = user.get("password_hash")
+    if h:
+        try:
+            return bcrypt.checkpw(password.encode(), h.encode())
+        except ValueError:
+            log.error("password_hash invalide pour %s (attendu: hash bcrypt)", user.get("username"))
+            return False
+    pw = user.get("password")
+    if pw is not None:
+        log.warning("Utilisateur '%s' avec mot de passe en clair — migrer vers password_hash "
+                    "(python -m gateway.hash_password)", user.get("username"))
+        return secrets.compare_digest(pw, password)
+    return False
 
 def create_token(username: str, roles: list[str]) -> str:
     now = datetime.now(timezone.utc)
@@ -136,9 +175,8 @@ class LoginReq(BaseModel):
 
 @router.post("/token")
 async def login(body: LoginReq):
-    user = next((u for u in _load_users()
-                 if u["username"] == body.username and u["password"] == body.password), None)
-    if not user:
+    user = next((u for u in _load_users() if u["username"] == body.username), None)
+    if not user or not _check_password(user, body.password):
         raise HTTPException(401, "Identifiants incorrects")
     token = create_token(user["username"], user["roles"])
     return {

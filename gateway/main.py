@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-from pydantic import BaseModel
+from pydantic import BaseModel, Field as PydField
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, event as sa_event, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +34,12 @@ RATE_LIMITS = {
 }
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
+# Politique de vérification des clés d'hôte SSH :
+#   strict   → host_key requis en DB, sinon la commande est refusée (défaut)
+#   tofu     → Trust On First Use : la clé est récupérée et épinglée au premier exec
+#   insecure → aucune vérification (MITM possible — dev/local uniquement)
+SSH_HOST_KEY_POLICY = os.getenv("SSH_HOST_KEY_POLICY", "strict").lower()
+
 class Host(Base):
     __tablename__ = "hosts"
     id            = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -44,6 +50,7 @@ class Host(Base):
     env           = Column(String, nullable=False, default="development")
     vault_role    = Column(String, nullable=False, default="dev-ssh")
     allowed_roles = Column(String, nullable=False, default="dev")
+    host_key      = Column(Text)   # clé publique SSH de l'hôte (format authorized_keys) — épinglage
     enabled       = Column(Boolean, default=True)
     created_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     updated_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
@@ -108,6 +115,13 @@ async def lifespan(app: FastAPI):
             raise
         log.warning("DB schema already exists (concurrent startup) — continuing")
 
+    # Migration légère : ajoute hosts.host_key sur les bases existantes
+    try:
+        async with engine.begin() as conn:
+            await conn.exec_driver_sql("ALTER TABLE hosts ADD COLUMN host_key TEXT")
+    except Exception:
+        pass  # colonne déjà présente
+
     # DB pool metrics via SQLAlchemy events (no-op on SQLite which has no pool)
     try:
         @sa_event.listens_for(engine.sync_engine, "checkout")
@@ -154,12 +168,13 @@ class HostBody(BaseModel):
     env:           str    = "development"
     vault_role:    str    = "dev-ssh"
     allowed_roles: str    = "dev"
+    host_key:      Optional[str] = None
     enabled:       bool   = True
 
 class ExecReq(BaseModel):
     host:       str
-    command:    str
-    timeout:    int  = 60
+    command:    str = PydField(max_length=8192)
+    timeout:    int = PydField(default=60, ge=1, le=600)
     session_id: Optional[str] = None
 
 # ── Host helpers ──────────────────────────────────────────────────────────────
@@ -167,7 +182,7 @@ def _host_dict(h: Host) -> dict:
     return {
         "id": h.id, "name": h.name, "hostname": h.hostname, "port": h.port,
         "ssh_user": h.ssh_user, "env": h.env, "vault_role": h.vault_role,
-        "allowed_roles": h.allowed_roles, "enabled": h.enabled,
+        "allowed_roles": h.allowed_roles, "host_key": h.host_key, "enabled": h.enabled,
         "created_at": h.created_at.isoformat() if h.created_at else None,
     }
 
@@ -197,7 +212,8 @@ async def update_host(host_id: str, body: HostBody, user=Depends(require_admin),
     host = (await db.execute(select(Host).where(Host.id == host_id))).scalar_one_or_none()
     if not host:
         raise HTTPException(404)
-    for k, v in body.model_dump().items():
+    # exclude_unset : ne pas écraser host_key (épinglée via TOFU) si le client ne l'envoie pas
+    for k, v in body.model_dump(exclude_unset=True).items():
         setattr(host, k, v)
     host.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.commit()
@@ -212,6 +228,35 @@ async def delete_host(host_id: str, user=Depends(require_admin), db: AsyncSessio
     host.enabled = False
     await db.commit()
     return {"deleted": True}
+
+# ── Host key verification ─────────────────────────────────────────────────────
+def _known_hosts_data(hostname: str, port: int, pubkey: str) -> str:
+    """Construit une entrée au format known_hosts pour l'hôte épinglé."""
+    name = hostname if port == 22 else f"[{hostname}]:{port}"
+    return f"{name} {pubkey.strip()}\n"
+
+async def _resolve_known_hosts(host: Host, db: AsyncSession):
+    """Retourne l'objet known_hosts pour asyncssh selon SSH_HOST_KEY_POLICY."""
+    if SSH_HOST_KEY_POLICY == "insecure":
+        log.warning("SSH_HOST_KEY_POLICY=insecure — clé d'hôte de '%s' NON vérifiée", host.name)
+        return None
+    if not host.host_key:
+        if SSH_HOST_KEY_POLICY == "tofu":
+            key = await asyncssh.get_server_host_key(
+                host.hostname, port=host.port,
+                options=asyncssh.SSHClientConnectionOptions(known_hosts=None, connect_timeout=10),
+            )
+            pub = key.export_public_key().decode().strip()
+            host.host_key = pub
+            await db.commit()
+            log.warning("TOFU: clé d'hôte de '%s' épinglée (%s)", host.name, pub.split()[0])
+        else:  # strict
+            raise HTTPException(
+                428,
+                f"Clé d'hôte inconnue pour '{host.name}'. La renseigner via PUT /hosts/{host.id} "
+                "(champ host_key, format authorized_keys), ou définir SSH_HOST_KEY_POLICY=tofu.",
+            )
+    return asyncssh.import_known_hosts(_known_hosts_data(host.hostname, host.port, host.host_key))
 
 # ── Route: Exec ───────────────────────────────────────────────────────────────
 @app.post("/exec")
@@ -251,13 +296,22 @@ async def exec_cmd(body: ExecReq, req: Request, user=Depends(current_user), db: 
     except Exception as e:
         raise HTTPException(500, f"Credential SSH error: {e}")
 
-    # 5. Exec
+    # 5. Host key (épinglage anti-MITM) puis exec
+    try:
+        known_hosts = await _resolve_known_hosts(host, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("Host key %s: %s", host.name, e)
+        CMD_TOTAL.labels(env=host.env, status="error").inc()
+        return {"status": "error", "reason": f"Clé d'hôte irrécupérable pour '{host.name}': {e}"}
+
     SESS_GAUGE.inc()
     stdout = stderr = ""; exit_code = -1
     try:
         conn_kwargs = dict(
             host=host.hostname, port=host.port, username=host.ssh_user,
-            known_hosts=None, connect_timeout=10,
+            known_hosts=known_hosts, connect_timeout=10,
         )
         if key_path:
             conn_kwargs["client_keys"] = [key_path]
@@ -444,9 +498,17 @@ if _static.exists():
     if _assets.exists():
         app.mount("/assets", StaticFiles(directory=str(_assets)), name="assets")
 
+    _static_root = _static.resolve()
+
     @app.get("/{full_path:path}", include_in_schema=False)
     async def spa_fallback(full_path: str):
-        file = _static / full_path
+        try:
+            file = (_static / full_path).resolve()
+        except (OSError, ValueError):
+            raise HTTPException(404)
+        # Anti path-traversal : ne servir que des fichiers sous /app/static
+        if not file.is_relative_to(_static_root):
+            raise HTTPException(404)
         if file.is_file():
             return FileResponse(str(file))
-        return FileResponse(str(_static / "index.html"))
+        return FileResponse(str(_static_root / "index.html"))
