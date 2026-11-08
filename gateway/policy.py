@@ -12,7 +12,7 @@ En production, le défaut est DENY (allow-list) sauf si POLICY_PROD_DEFAULT=allo
 import json, logging, os, re, time, uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -43,7 +43,8 @@ DEFAULT_POLICIES = [
     {"id":"p005","name":"Block curl|bash",          "env":"all",         "pattern":r"(curl|wget).+\|.*(bash|sh)",        "action":"deny", "enabled":True,  "severity":"critical"},
     {"id":"p006","name":"Block chmod 777",          "env":"all",         "pattern":r"chmod\s+(-\w+\s+)*777",             "action":"deny", "enabled":True,  "severity":"high"},
     {"id":"p007","name":"Warn find /",              "env":"production",  "pattern":r"find\s+/",                          "action":"warn", "enabled":True,  "severity":"medium"},
-    {"id":"p008","name":"Allow read-only ops",      "env":"all",         "pattern":r"^(df|du|free|ps|cat|ls|tail|head|grep|uptime|uname|id|whoami|hostname|date|systemctl\s+status|journalctl)\b", "action":"allow","enabled":True,"severity":"info"},
+    # Full-match sans métacaractères shell : "ls; <payload>" ne doit PAS matcher
+    {"id":"p008","name":"Allow read-only ops",      "env":"all",         "pattern":r"^(df|du|free|ps|cat|ls|tail|head|grep|uptime|uname|id|whoami|hostname|date|systemctl\s+status|journalctl)\b[^;&|<>$()`\n\r]*\Z", "action":"allow","enabled":True,"severity":"info"},
     {"id":"p009","name":"Block reboot/shutdown",    "env":"all",         "pattern":r"\breboot\b|shutdown\b|\bpoweroff\b|\bhalt\b|systemctl\s+(reboot|poweroff|halt)|init\s+[06]\b|telinit\s+[06]\b", "action":"deny","enabled":True,"severity":"critical"},
 ]
 
@@ -95,6 +96,25 @@ class PolicyEngine:
                     await db.commit()
                 except Exception:
                     await db.rollback()  # course entre workers au premier démarrage — l'autre a seedé
+            else:
+                # Migration ciblée : durcit p008 si elle porte encore un ancien pattern
+                # préfixe-seulement (contournable par chaînage "ls; <payload>")
+                _OLD_P008 = (
+                    r"^(df|du|free|ps|cat|ls|tail|grep|uptime|uname|id|whoami|hostname|date)",
+                    r"^(df|du|free|ps|cat|ls|tail|head|grep|uptime|uname|id|whoami|hostname|date|systemctl\s+status|journalctl)\b",
+                )
+                new_p008 = next(r["pattern"] for r in DEFAULT_POLICIES if r["id"] == "p008")
+                try:
+                    res = await db.execute(
+                        sa_update(Policy)
+                        .where(Policy.id == "p008", Policy.pattern.in_(_OLD_P008))
+                        .values(pattern=new_p008)
+                    )
+                    await db.commit()
+                    if res.rowcount:
+                        log.warning("Policy p008 migrée vers le pattern full-match (anti-chaînage)")
+                except Exception:
+                    await db.rollback()
         await self._refresh(force=True)
         log.info("Policy engine prêt — %d règles, prod_default=%s", len(self._compiled), POLICY_PROD_DEFAULT)
 
@@ -158,9 +178,11 @@ class PolicyEngine:
 # ── Routes ────────────────────────────────────────────────────────────────────
 router = APIRouter(prefix="/policies", tags=["policies"])
 
+PolicyEnv = Literal["all", "production", "staging", "development"]
+
 class PolicyCreate(BaseModel):
     name: str
-    env: str = "all"
+    env: PolicyEnv = "all"
     pattern: str
     action: str = "deny"
     severity: str = "high"
@@ -168,7 +190,7 @@ class PolicyCreate(BaseModel):
 
 class PolicyUpdate(BaseModel):
     name: Optional[str] = None
-    env: Optional[str] = None
+    env: Optional[PolicyEnv] = None
     pattern: Optional[str] = None
     action: Optional[str] = None
     severity: Optional[str] = None

@@ -36,9 +36,19 @@ spec:
                 secretKeyRef:
                   name: {{ .Release.Name }}-secret
                   key: jwt_secret
+            {{- if .Values.gatewayUsers }}
+            - name: GATEWAY_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-secret
+                  key: gateway_users
+            {{- end }}
             {{- range $k, $v := .Values.env }}
+            {{- /* JWT_SECRET vient du Secret ci-dessus ; les valeurs vides sont ignorées */}}
+            {{- if and (ne $k "JWT_SECRET") $v }}
             - name: {{ $k }}
               value: {{ $v | quote }}
+            {{- end }}
             {{- end }}
           volumeMounts:
             - name: ssh-key

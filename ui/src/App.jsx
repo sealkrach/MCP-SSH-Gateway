@@ -208,7 +208,8 @@ function HostsView() {
   ), [hostList,search,envF])
 
   const openAdd  = () => { setForm(EMPTY_HOST); setEditId(null); setFormErr(null); setShowAdd(true) }
-  const openEdit = h => { setForm({...h, allowed_roles: Array.isArray(h.allowed_roles)?h.allowed_roles.join(','):h.allowed_roles}); setEditId(h.id); setFormErr(null); setShowAdd(true) }
+  // host_key exclu du formulaire : ne pas écraser une clé épinglée (TOFU) avec une valeur périmée
+  const openEdit = h => { const {host_key, ...rest} = h; setForm({...rest, allowed_roles: Array.isArray(h.allowed_roles)?h.allowed_roles.join(','):h.allowed_roles}); setEditId(h.id); setFormErr(null); setShowAdd(true) }
   const save = async () => {
     setSaving(true); setFormErr(null)
     try {
@@ -227,7 +228,8 @@ function HostsView() {
     setTesting(t => ({...t, [host.id]: {loading: true}}))
     const t0 = Date.now()
     try {
-      const res = await api.exec(host.name, 'echo ok', 5)
+      // uptime est dans la règle allow p008 — fonctionne aussi en prod (allow-list)
+      const res = await api.exec(host.name, 'uptime', 5)
       const ms = Date.now() - t0
       const ok = res.status === 'allowed' && res.exit_code === 0
       setTesting(t => ({...t, [host.id]: {loading: false, ok, ms, error: ok ? null : (res.reason || res.stderr || 'Échec')}}))
@@ -1015,7 +1017,7 @@ export default function App() {
             </div>
           </div>
           <nav style={{flex:1,padding:'16px 12px',display:'flex',flexDirection:'column',gap:4}}>
-            {nav.filter(n=>n.id!=='settings'||isAdmin).map(n=>(
+            {nav.filter(n=>!['settings','policies'].includes(n.id)||isAdmin).map(n=>(
               <button key={n.id} onClick={()=>setView(n.id)} style={{display:'flex',alignItems:'center',gap:10,width:'100%',padding:'10px 12px',borderRadius:10,border:'none',cursor:'pointer',transition:'all 0.15s',textAlign:'left',background:view===n.id?C.blue+'20':'transparent',color:view===n.id?C.blue:C.muted,fontFamily:FUI,fontWeight:view===n.id?600:400,fontSize:14}}>
                 <n.icon size={16}/>{n.label}
                 {view===n.id&&<div style={{marginLeft:'auto',width:4,height:4,borderRadius:'50%',background:C.blue}}/>}

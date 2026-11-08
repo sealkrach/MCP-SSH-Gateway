@@ -5,7 +5,7 @@ Routes: auth, hosts CRUD, exec SSH, policies CRUD, audit, metrics summary, healt
 import asyncio, hashlib, logging, os, time, uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 import asyncssh
 import redis.asyncio as redis
@@ -169,9 +169,11 @@ app.include_router(policy_router)
 class HostBody(BaseModel):
     name:          str
     hostname:      str
-    port:          int    = 22
-    ssh_user:      str    = "deploy"
-    env:           str    = "development"
+    port:          int = PydField(default=22, ge=1, le=65535)
+    ssh_user:      str = "deploy"
+    # Littéral strict : un env inconnu ("prod", "Production"…) échapperait aux
+    # policies et au rate limit de production
+    env:           Literal["production", "staging", "development"] = "development"
     vault_role:    str    = "dev-ssh"
     allowed_roles: str    = "dev"
     host_key:      Optional[str] = None
@@ -300,15 +302,8 @@ async def exec_cmd(body: ExecReq, req: Request, user=Depends(current_user), db: 
         CMD_TOTAL.labels(env=host.env, status="denied").inc()
         return {"status": "denied", "reason": pol["reason"]}
 
-    # 4. SSH credential (Vault cert, Vault KV, clé statique ou CyberArk) — en mémoire
-    try:
-        client_keys, password = await req.app.state.vault.get_credential(host.vault_role, username)
-    except Exception as e:
-        # Détail loggé côté serveur uniquement (peut contenir URLs/réponses internes)
-        log.error("Credential SSH role=%s host=%s: %s", host.vault_role, host.name, e)
-        raise HTTPException(500, "Impossible de récupérer le credential SSH — voir les logs serveur")
-
-    # 5. Host key (épinglage anti-MITM) puis exec
+    # 4. Host key (épinglage anti-MITM) — avant le credential : inutile de signer
+    #    un certificat Vault si l'hôte n'est pas vérifiable
     try:
         known_hosts = await _resolve_known_hosts(host, db)
     except HTTPException as e:
@@ -320,6 +315,14 @@ async def exec_cmd(body: ExecReq, req: Request, user=Depends(current_user), db: 
         await _audit(db, sid, username, host, body.command, "error", "Clé d'hôte irrécupérable", None, None, 0, "host-key")
         CMD_TOTAL.labels(env=host.env, status="error").inc()
         return {"status": "error", "reason": f"Clé d'hôte irrécupérable pour '{host.name}'"}
+
+    # 5. SSH credential (Vault cert, Vault KV, clé statique ou CyberArk) — en mémoire
+    try:
+        client_keys, password = await req.app.state.vault.get_credential(host.vault_role, username)
+    except Exception as e:
+        # Détail loggé côté serveur uniquement (peut contenir URLs/réponses internes)
+        log.error("Credential SSH role=%s host=%s: %s", host.vault_role, host.name, e)
+        raise HTTPException(500, "Impossible de récupérer le credential SSH — voir les logs serveur")
 
     SESS_GAUGE.inc()
     stdout = stderr = ""; exit_code = -1

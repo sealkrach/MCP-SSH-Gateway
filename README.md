@@ -241,8 +241,11 @@ helm upgrade --install mcp-ssh ./helm \
   --set image.repository=registry.example.com/mcp-ssh-gateway \
   --set env.JWT_SECRET=your-32-char-secret \
   --set database.password=your-db-password \
+  --set gatewayUsers='[{"username":"admin","password_hash":"$2b$12$...","roles":["admin"]}]' \
   --set ingress.host=mcp-ssh.example.internal
 ```
+
+`gatewayUsers` is required to be able to log in (demo accounts are disabled by default); generate the bcrypt hash with `python -m gateway.hash_password`. The chart defaults to `SSH_HOST_KEY_POLICY=strict` and `POLICY_PROD_DEFAULT=deny`.
 
 ## Security notes
 

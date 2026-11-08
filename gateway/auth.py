@@ -13,7 +13,7 @@ import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
-from pydantic import BaseModel
+from pydantic import BaseModel, Field as PydField
 from sqlalchemy import Boolean, Column, DateTime, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -174,7 +174,10 @@ class LoginReq(BaseModel):
     password: str
 
 # ── Anti brute-force ──────────────────────────────────────────────────────────
+# Deux compteurs : user+IP (strict) et user seul (seuil plus haut — contre le
+# spoof de X-Forwarded-For quand le gateway est joignable en direct)
 LOGIN_MAX_FAILS       = int(os.getenv("LOGIN_MAX_FAILS", "5"))
+LOGIN_MAX_FAILS_USER  = int(os.getenv("LOGIN_MAX_FAILS_USER", "20"))
 LOGIN_LOCKOUT_SECONDS = int(os.getenv("LOGIN_LOCKOUT_SECONDS", "900"))
 # Hash factice : coût bcrypt identique quand l'utilisateur n'existe pas
 # (anti-énumération par timing)
@@ -189,10 +192,12 @@ def _client_ip(request: Request) -> str:
 @router.post("/token")
 async def login(body: LoginReq, request: Request):
     rds = getattr(request.app.state, "redis", None)
-    lock_key = f"login_fail:{body.username}:{_client_ip(request)}"
+    lock_ip   = f"login_fail:{body.username}:{_client_ip(request)}"
+    lock_user = f"login_fail_user:{body.username}"
     if rds:
         try:
-            if int(await rds.get(lock_key) or 0) >= LOGIN_MAX_FAILS:
+            if (int(await rds.get(lock_ip) or 0) >= LOGIN_MAX_FAILS
+                    or int(await rds.get(lock_user) or 0) >= LOGIN_MAX_FAILS_USER):
                 raise HTTPException(429, f"Trop de tentatives — réessayer dans {LOGIN_LOCKOUT_SECONDS // 60} min")
         except HTTPException:
             raise
@@ -210,8 +215,8 @@ async def login(body: LoginReq, request: Request):
         if rds:
             try:
                 pipe = rds.pipeline()
-                pipe.incr(lock_key)
-                pipe.expire(lock_key, LOGIN_LOCKOUT_SECONDS)
+                pipe.incr(lock_ip);   pipe.expire(lock_ip,   LOGIN_LOCKOUT_SECONDS)
+                pipe.incr(lock_user); pipe.expire(lock_user, LOGIN_LOCKOUT_SECONDS)
                 await pipe.execute()
             except Exception:
                 pass
@@ -220,7 +225,7 @@ async def login(body: LoginReq, request: Request):
 
     if rds:
         try:
-            await rds.delete(lock_key)
+            await rds.delete(lock_ip, lock_user)
         except Exception:
             pass
     token = create_token(user["username"], user["roles"])
@@ -236,14 +241,14 @@ async def me(user: dict = Depends(current_user)):
 
 @router.get("/users")
 async def list_users(user: dict = Depends(require_admin)):
-    return [{"username": u["username"], "roles": u["roles"]} for u in _load_users()]
+    return [{"username": u.get("username", "?"), "roles": u.get("roles", [])} for u in _load_users()]
 
 # ── API Token CRUD ────────────────────────────────────────────────────────────
 class TokenCreate(BaseModel):
     name:         str
     username:     Optional[str]       = None
     roles:        Optional[list[str]] = None
-    expires_days: Optional[int]       = None  # None = never expires
+    expires_days: Optional[int]       = PydField(default=None, ge=1, le=3650)  # None = never expires
 
 @router.post("/tokens", status_code=201)
 async def create_api_token(

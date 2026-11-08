@@ -15,10 +15,18 @@ ingress:
   host: mcp-ssh.internal
   tls: true
 
+# Utilisateurs du gateway (JSON, hash bcrypt via `python -m gateway.hash_password`).
+# REQUIS pour pouvoir se connecter : sans lui, aucun compte n'existe
+# (les comptes de démo sont désactivés par défaut).
+# Ex: '[{"username":"admin","password_hash":"$2b$12$...","roles":["admin"]}]'
+gatewayUsers: ""
+
 env:
-  JWT_SECRET: ""           # Required — override in secret
+  JWT_SECRET: ""           # Required — injecté via le Secret (jamais en env direct)
   JWT_EXPIRE_HOURS: "24"
-  SSH_MODE: key            # key | vault
+  SSH_MODE: key            # key | vault | vault-kv | cyberark
+  SSH_HOST_KEY_POLICY: strict   # strict | tofu | insecure
+  POLICY_PROD_DEFAULT: deny     # deny = allow-list en production
   SSH_KEY_PATH: /run/secrets/ssh_key
   VAULT_URL: ""
   VAULT_TOKEN: ""
